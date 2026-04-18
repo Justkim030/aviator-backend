@@ -166,27 +166,29 @@ io.on('connection', (socket) => {
         }
         if (!socket.phone) return socket.emit('betError', 'Please login to bet.');
 
+        const betAmount = Number(amount);
+
         // Security: Prevent multiple bets from the same user in the same round
         if (activeBets.has(socket.id)) return socket.emit('betError', 'Bet already placed for this round.');
 
         try {
             const user = db.prepare('SELECT balance FROM users WHERE phone = ?').get(socket.phone);
-            if (!user || user.balance < amount) {
+            if (!user || user.balance < betAmount || betAmount <= 0) {
                 return socket.emit('betError', 'Insufficient balance.');
             }
 
             // 1. Deduct from Database immediately
-            db.prepare('UPDATE users SET balance = balance - ? WHERE phone = ?').run(amount, socket.phone);
+            db.prepare('UPDATE users SET balance = balance - ? WHERE phone = ?').run(betAmount, socket.phone);
             
             // 2. Track bet in memory for the duration of the flight
-            activeBets.set(socket.id, { phone: socket.phone, amount, status: 'active' });
+            activeBets.set(socket.id, { phone: socket.phone, amount: betAmount, status: 'active' });
             
             // 3. Notify user and others
-            const newBal = user.balance - amount;
+            const newBal = user.balance - betAmount;
             socket.emit('balanceUpdate', { balance: newBal });
-            io.emit('playerBet', { user: socket.phone.replace(/(\d{3})\d+(\d{3})/, '$1***$2'), amount });
+            io.emit('playerBet', { user: socket.phone.replace(/(\d{3})\d+(\d{3})/, '$1***$2'), amount: betAmount });
             
-            console.log(`Bet placed: ${socket.phone} - KES ${amount}`);
+            console.log(`Bet placed: ${socket.phone} - KES ${betAmount}`);
         } catch (e) {
             console.error('Bet placement error:', e);
         }
