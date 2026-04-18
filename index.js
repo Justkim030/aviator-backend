@@ -1,0 +1,280 @@
+require('dotenv').config();
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const cors = require('cors');
+const axios = require('axios');
+const { DatabaseSync } = require('node:sqlite');
+const crypto = require('crypto');
+const bcrypt = require('bcrypt');
+
+const app = express();
+app.use(cors({ origin: process.env.FRONTEND_URL || "*" }));
+app.use(express.json());
+
+const server = http.createServer(app);
+const io = new Server(server, {
+    cors: { origin: process.env.FRONTEND_URL || "*" },
+    transports: ['websocket']
+});
+
+// ─── DATABASE SETUP ──────────────────────────────────────────────────────────
+const db = new DatabaseSync(process.env.DB_PATH || './aviator.db');
+
+// Initialize tables
+db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+        phone TEXT PRIMARY KEY,
+        password TEXT,
+        balance REAL DEFAULT 0.0
+    )
+`);
+
+// Map to track active connections: phone number -> socket ID
+const activeUsers = new Map();
+
+// ─── GAME STATE ──────────────────────────────────────────────────────────────
+let gameState = {
+    phase: 'waiting',      // waiting, countdown, flying, crashed
+    roundId: 0,
+    multiplier: 1.00,
+    startTime: 0,
+    countdown: 5,
+    history: [1.22, 5.43, 1.08, 12.99, 3.21],
+    serverSeedHash: '',
+    clientSeed: 'aviator-community-seed',
+    nonce: 0
+};
+
+let currentServerSeed = '';
+let gameLoopInterval = null;
+
+// ─── LOGIC ───────────────────────────────────────────────────────────────────
+
+/**
+ * Generates a crash point using HMAC-SHA256 (Provably Fair)
+ */
+function generateProvablyFairCrash(serverSeed, clientSeed, nonce) {
+    const hmac = crypto.createHmac('sha256', serverSeed);
+    hmac.update(`${clientSeed}:${nonce}`);
+    const hash = hmac.digest('hex');
+    
+    // Use the first 8 characters of the hash for the random value
+    const decimal = parseInt(hash.slice(0, 8), 16) / 0xFFFFFFFF;
+
+    if (decimal < 0.01) return 1.00; // 1% Instant crash
+    const crash = Math.max(1.00, Math.floor(100 * (0.99 / (1 - decimal))) / 100);
+    return parseFloat(crash.toFixed(2));
+}
+
+function startCycle() {
+    gameState.phase = 'countdown';
+    gameState.countdown = 5;
+    gameState.multiplier = 1.00;
+    gameState.roundId++;
+    gameState.nonce++;
+
+    // Generate new seeds for the round
+    currentServerSeed = crypto.randomBytes(32).toString('hex');
+    gameState.serverSeedHash = crypto.createHash('sha256').update(currentServerSeed).digest('hex');
+
+    const cd = setInterval(() => {
+        gameState.countdown--;
+        io.emit('countdown', { 
+            countdown: gameState.countdown,
+            serverSeedHash: gameState.serverSeedHash // Users can see the hash BEFORE the round starts
+        });
+
+        if (gameState.countdown <= 0) {
+            clearInterval(cd);
+            beginFlight();
+        }
+    }, 1000);
+}
+
+function beginFlight() {
+    gameState.phase = 'flying';
+    gameState.startTime = Date.now();
+    
+    const targetCrash = generateProvablyFairCrash(currentServerSeed, gameState.clientSeed, gameState.nonce);
+    
+    console.log(`[Round ${gameState.roundId}] Started. Target: ${targetCrash}x`);
+    io.emit('flightStart', { startTime: gameState.startTime });
+
+    gameLoopInterval = setInterval(() => {
+        const elapsed = (Date.now() - gameState.startTime) / 1000;
+        // Exponential growth: 1.00 * e^(0.1 * t)
+        // This matches the curve logic mentioned in your visual breakdown
+        gameState.multiplier = Math.pow(Math.E, 0.12 * elapsed);
+
+        if (gameState.multiplier >= targetCrash) {
+            endFlight();
+        } else {
+            io.emit('multiplierUpdate', { multiplier: gameState.multiplier });
+        }
+    }, 50); // 20 updates per second for smooth rendering
+}
+
+function endFlight() {
+    clearInterval(gameLoopInterval);
+    gameState.phase = 'crashed';
+    const finalMult = parseFloat(gameState.multiplier.toFixed(2));
+    
+    gameState.history.unshift(finalMult);
+    gameState.history = gameState.history.slice(0, 20);
+
+    io.emit('crash', { 
+        crashMultiplier: finalMult,
+        serverSeed: currentServerSeed, // Reveal the seed so players can verify the hash
+        history: gameState.history
+    });
+
+    // Wait 3 seconds at the crashed screen before starting next round
+    setTimeout(() => {
+        startCycle();
+    }, 3000);
+}
+
+// ─── SOCKET CONNECTION ───────────────────────────────────────────────────────
+io.on('connection', (socket) => {
+    console.log('User connected:', socket.id);
+    // Send current game state to the new user so they sync immediately
+    socket.emit('gameState', gameState);
+
+    // Register user by phone so we can send them targeted balance updates
+    socket.on('registerUser', (phone) => {
+        if (phone) activeUsers.set(phone, socket.id);
+        console.log(`Socket ${socket.id} registered to phone ${phone}`);
+    });
+
+    socket.on('disconnect', () => {
+        console.log('User disconnected');
+        // Cleanup mapping on disconnect
+        for (const [phone, id] of activeUsers.entries()) {
+            if (id === socket.id) activeUsers.delete(phone);
+        }
+    });
+});
+
+// ─── AUTH API ────────────────────────────────────────────────────────────────
+app.post('/api/register', async (req, res) => {
+    const { phone, password } = req.body;
+    if (!phone || !password) return res.status(400).json({ status: false, message: 'Missing phone or password' });
+
+    try {
+        const check = db.prepare('SELECT phone FROM users WHERE phone = ?').get(phone);
+        if (check) return res.status(400).json({ status: false, message: 'User already exists' });
+
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const insert = db.prepare('INSERT INTO users (phone, password, balance) VALUES (?, ?, ?)');
+        insert.run(phone, hashedPassword, 0.0);
+        res.json({ status: true, message: 'Registration successful' });
+    } catch (e) {
+        console.error('Registration Error:', e);
+        res.status(500).json({ status: false, message: 'Server error' });
+    }
+});
+
+app.post('/api/login', async (req, res) => {
+    const { phone, password } = req.body;
+    if (!phone || !password) return res.status(400).json({ status: false, message: 'Missing phone or password' });
+
+    try {
+        const user = db.prepare('SELECT * FROM users WHERE phone = ?').get(phone);
+        const isMatch = user ? await bcrypt.compare(password, user.password) : false;
+
+        if (!isMatch) {
+            return res.status(401).json({ status: false, message: 'Invalid phone or password' });
+        }
+        res.json({ 
+            status: true, 
+            user: { phone: user.phone, balance: user.balance } 
+        });
+    } catch (e) {
+        console.error('Login Error:', e);
+        res.status(500).json({ status: false, message: 'Server error' });
+    }
+});
+
+// ─── DEPOSIT API (REAL STK PUSH) ─────────────────────────────────────────────
+app.post('/api/deposit', async (req, res) => {
+    const { amount, phone, email } = req.body;
+
+    try {
+        // Using Paystack Charge API for M-Pesa STK Push
+        const response = await axios.post(
+            'https://api.paystack.co/charge',
+            {
+                email: email || 'customer@example.com',
+                amount: amount * 100, // Paystack expects cents/kobo
+                currency: "KES",
+                metadata: { phone },
+                mobile_money: {
+                    phone: phone,
+                    provider: "mpesa"
+                }
+            },
+            {
+                headers: {
+                    Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+                    'Content-Type': 'application/json'
+                }
+            }
+        );
+
+        res.json({ status: true, data: response.data });
+    } catch (error) {
+        console.error('STK Push Error:', error.response?.data || error.message);
+        res.status(500).json({ status: false, message: 'Failed to initiate STK push' });
+    }
+});
+
+// ─── PAYSTACK WEBHOOK ────────────────────────────────────────────────────────
+// This endpoint receives confirmation from Paystack when the user enters their PIN.
+app.post('/api/webhook', (req, res) => {
+    const secret = process.env.PAYSTACK_SECRET_KEY;
+    
+    // Verify that the request actually came from Paystack
+    const hash = crypto.createHmac('sha512', secret)
+                       .update(JSON.stringify(req.body))
+                       .digest('hex');
+
+    if (hash !== req.headers['x-paystack-signature']) {
+        return res.status(401).send('Unauthorized');
+    }
+
+    const { event, data } = req.body;
+
+    if (event === 'charge.success') {
+        const amount = data.amount / 100; // Convert back from cents to KES
+        const phone = data.metadata?.phone;
+
+        if (phone) {
+            const upsert = db.prepare(`
+                INSERT INTO users (phone, balance) VALUES (?, ?)
+                ON CONFLICT(phone) DO UPDATE SET balance = balance + ?
+            `);
+            const result = upsert.run(phone, amount, amount);
+            
+            // Fetch the updated balance to send back to the user
+            const row = db.prepare('SELECT balance FROM users WHERE phone = ?').get(phone);
+            console.log(`[WEBHOOK] Successfully credited KES ${amount} to ${phone}. New balance: ${row.balance}`);
+
+            // Notify the specific user via Socket.io if they are online
+            const socketId = activeUsers.get(phone);
+            if (socketId) {
+                io.to(socketId).emit('balanceUpdate', { balance: row.balance });
+            }
+        }
+    }
+
+    res.status(200).send('OK');
+});
+
+// Start the first game cycle
+startCycle();
+
+const PORT = process.env.PORT || 3001;
+server.listen(PORT, () => {
+    console.log(`Aviator Server running on port ${PORT}`);
+});

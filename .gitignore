@@ -1,0 +1,7 @@
+node_modules/
+.env
+aviator.db
+aviator.db-journal
+*.log
+.DS_Store
+dist/
