@@ -33,6 +33,9 @@ db.exec(`
 // Map to track active connections: phone number -> socket ID
 const activeUsers = new Map();
 
+// Map to track current round bets: socketId -> { phone, amount, status }
+let activeBets = new Map();
+
 // ─── GAME STATE ──────────────────────────────────────────────────────────────
 let gameState = {
     phase: 'waiting',      // waiting, countdown, flying, crashed
@@ -73,6 +76,8 @@ function startCycle() {
     gameState.multiplier = 1.00;
     gameState.roundId++;
     gameState.nonce++;
+    
+    activeBets.clear(); // Clear bets from the previous round
 
     // Generate new seeds for the round
     currentServerSeed = crypto.randomBytes(32).toString('hex');
@@ -123,6 +128,10 @@ function endFlight() {
     gameState.history.unshift(finalMult);
     gameState.history = gameState.history.slice(0, 20);
 
+    // Any bet still in 'active' status is now lost. 
+    // In a professional setup, you'd log these losses to a 'bets' table here.
+    activeBets.clear();
+
     io.emit('crash', { 
         crashMultiplier: finalMult,
         serverSeed: currentServerSeed, // Reveal the seed so players can verify the hash
@@ -143,15 +152,84 @@ io.on('connection', (socket) => {
 
     // Register user by phone so we can send them targeted balance updates
     socket.on('registerUser', (phone) => {
-        if (phone) activeUsers.set(phone, socket.id);
-        console.log(`Socket ${socket.id} registered to phone ${phone}`);
+        if (phone) {
+            socket.phone = phone; // Attach phone to socket for easier lookup
+            activeUsers.set(phone, socket.id);
+            console.log(`Socket ${socket.id} registered to phone ${phone}`);
+        }
+    });
+
+    // ─── BETTING LOGIC ───────────────────────────────────────────────────────
+    socket.on('placeBet', ({ amount }) => {
+        if (gameState.phase !== 'waiting' && gameState.phase !== 'countdown') {
+            return socket.emit('betError', 'Bets only accepted before flight.');
+        }
+        if (!socket.phone) return socket.emit('betError', 'Please login to bet.');
+
+        // Security: Prevent multiple bets from the same user in the same round
+        if (activeBets.has(socket.id)) return socket.emit('betError', 'Bet already placed for this round.');
+
+        try {
+            const user = db.prepare('SELECT balance FROM users WHERE phone = ?').get(socket.phone);
+            if (!user || user.balance < amount) {
+                return socket.emit('betError', 'Insufficient balance.');
+            }
+
+            // 1. Deduct from Database immediately
+            db.prepare('UPDATE users SET balance = balance - ? WHERE phone = ?').run(amount, socket.phone);
+            
+            // 2. Track bet in memory for the duration of the flight
+            activeBets.set(socket.id, { phone: socket.phone, amount, status: 'active' });
+            
+            // 3. Notify user and others
+            const newBal = user.balance - amount;
+            socket.emit('balanceUpdate', { balance: newBal });
+            io.emit('playerBet', { user: socket.phone.replace(/(\d{3})\d+(\d{3})/, '$1***$2'), amount });
+            
+            console.log(`Bet placed: ${socket.phone} - KES ${amount}`);
+        } catch (e) {
+            console.error('Bet placement error:', e);
+        }
+    });
+
+    socket.on('cashOut', () => {
+        if (gameState.phase !== 'flying') return socket.emit('betError', 'Not in flight.');
+        
+        const bet = activeBets.get(socket.id);
+        if (!bet || bet.status !== 'active') return socket.emit('betError', 'No active bet.');
+
+        try {
+            const currentMult = gameState.multiplier;
+            const winAmount = parseFloat((bet.amount * currentMult).toFixed(2));
+
+            // 1. Mark as cashed out so they can't double-click
+            bet.status = 'cashed';
+            activeBets.delete(socket.id);
+
+            // 2. Update Database
+            db.prepare('UPDATE users SET balance = balance + ? WHERE phone = ?').run(winAmount, socket.phone);
+            
+            // 3. Fetch final balance to sync UI
+            const row = db.prepare('SELECT balance FROM users WHERE phone = ?').get(socket.phone);
+            
+            socket.emit('balanceUpdate', { balance: row.balance });
+            socket.emit('cashOutSuccess', { win: winAmount, multiplier: currentMult });
+            
+            io.emit('playerCashOut', { 
+                user: socket.phone.replace(/(\d{3})\d+(\d{3})/, '$1***$2'), 
+                multiplier: currentMult, 
+                win: winAmount 
+            });
+        } catch (e) {
+            console.error('Cashout error:', e);
+        }
     });
 
     socket.on('disconnect', () => {
-        console.log('User disconnected');
-        // Cleanup mapping on disconnect
-        for (const [phone, id] of activeUsers.entries()) {
-            if (id === socket.id) activeUsers.delete(phone);
+        console.log('User disconnected:', socket.id);
+        // Optimized O(1) cleanup using the phone attached to the socket
+        if (socket.phone && activeUsers.get(socket.phone) === socket.id) {
+            activeUsers.delete(socket.phone);
         }
     });
 });
