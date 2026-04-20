@@ -4,7 +4,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const axios = require('axios');
-const { DatabaseSync } = require('node:sqlite');
+const mysql = require('mysql2/promise');
 const crypto = require('crypto');
 const bcrypt = require('bcrypt');
 const path = require('path');
@@ -21,24 +21,33 @@ const io = new Server(server, {
 });
 
 // ─── DATABASE SETUP ──────────────────────────────────────────────────────────
-const dbPath = process.env.DB_PATH || path.join(__dirname, 'aviator.db');
+let db;
+async function initDB() {
+    db = await mysql.createPool({
+        host: process.env.DB_HOST || 'localhost',
+        user: process.env.DB_USER || 'root',
+        password: process.env.DB_PASS || '',
+        database: process.env.DB_NAME || 'aviator_db',
+        waitForConnections: true,
+        connectionLimit: 10,
+        queueLimit: 0
+    });
 
-// Ensure directory exists (useful for persistent volume mounts)
-const dbDir = path.dirname(dbPath);
-if (!fs.existsSync(dbDir)) {
-    fs.mkdirSync(dbDir, { recursive: true });
+    // Initialize tables
+    await db.execute(`
+        CREATE TABLE IF NOT EXISTS users (
+            phone VARCHAR(20) PRIMARY KEY,
+            password VARCHAR(255),
+            balance DECIMAL(15, 2) DEFAULT 0.00
+        )
+    `);
+    console.log('MySQL Connected and Tables Initialized');
 }
 
-const db = new DatabaseSync(dbPath);
-
-// Initialize tables
-db.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-        phone TEXT PRIMARY KEY,
-        password TEXT,
-        balance REAL DEFAULT 0.0
-    )
-`);
+initDB().catch(err => {
+    console.error('Failed to connect to MySQL:', err);
+    process.exit(1);
+});
 
 // Map to track active connections: phone number -> socket ID
 const activeUsers = new Map();
@@ -170,31 +179,32 @@ io.on('connection', (socket) => {
     });
 
     // ─── BETTING LOGIC ───────────────────────────────────────────────────────
-    socket.on('placeBet', ({ amount }) => {
+    socket.on('placeBet', async ({ amount }) => {
         if (gameState.phase !== 'waiting' && gameState.phase !== 'countdown') {
             return socket.emit('betError', 'Bets only accepted before flight.');
         }
         if (!socket.phone) return socket.emit('betError', 'Please login to bet.');
 
-        const betAmount = Number(amount);
-
-        // Security: Prevent multiple bets from the same user in the same round
+        const betAmount = Math.floor(Number(amount)); // Ensure integer for currency safety
         if (activeBets.has(socket.id)) return socket.emit('betError', 'Bet already placed for this round.');
+        if (isNaN(betAmount) || betAmount <= 0) return socket.emit('betError', 'Invalid bet amount.');
 
         try {
-            const user = db.prepare('SELECT balance FROM users WHERE phone = ?').get(socket.phone);
-            if (!user || user.balance < betAmount || betAmount <= 0) {
+            const [rows] = await db.execute('SELECT balance FROM users WHERE phone = ?', [socket.phone]);
+            const user = rows[0];
+
+            if (!user || Number(user.balance) < betAmount) {
                 return socket.emit('betError', 'Insufficient balance.');
             }
 
             // 1. Deduct from Database immediately
-            db.prepare('UPDATE users SET balance = balance - ? WHERE phone = ?').run(betAmount, socket.phone);
+            await db.execute('UPDATE users SET balance = balance - ? WHERE phone = ?', [betAmount, socket.phone]);
             
             // 2. Track bet in memory for the duration of the flight
             activeBets.set(socket.id, { phone: socket.phone, amount: betAmount, status: 'active' });
             
             // 3. Notify user and others
-            const newBal = user.balance - betAmount;
+            const newBal = Number(user.balance) - betAmount;
             socket.emit('balanceUpdate', { balance: newBal });
             io.emit('playerBet', { user: socket.phone.replace(/(\d{3})\d+(\d{3})/, '$1***$2'), amount: betAmount });
             
@@ -204,7 +214,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('cashOut', () => {
+    socket.on('cashOut', async () => {
         if (gameState.phase !== 'flying') return socket.emit('betError', 'Not in flight.');
         
         const bet = activeBets.get(socket.id);
@@ -219,12 +229,12 @@ io.on('connection', (socket) => {
             activeBets.delete(socket.id);
 
             // 2. Update Database
-            db.prepare('UPDATE users SET balance = balance + ? WHERE phone = ?').run(winAmount, socket.phone);
+            await db.execute('UPDATE users SET balance = balance + ? WHERE phone = ?', [winAmount, socket.phone]);
             
             // 3. Fetch final balance to sync UI
-            const row = db.prepare('SELECT balance FROM users WHERE phone = ?').get(socket.phone);
+            const [rows] = await db.execute('SELECT balance FROM users WHERE phone = ?', [socket.phone]);
             
-            socket.emit('balanceUpdate', { balance: row.balance });
+            socket.emit('balanceUpdate', { balance: rows[0].balance });
             socket.emit('cashOutSuccess', { win: winAmount, multiplier: currentMult });
             
             io.emit('playerCashOut', { 
@@ -252,12 +262,12 @@ app.post('/api/register', async (req, res) => {
     if (!phone || !password) return res.status(400).json({ status: false, message: 'Missing phone or password' });
 
     try {
-        const check = db.prepare('SELECT phone FROM users WHERE phone = ?').get(phone);
-        if (check) return res.status(400).json({ status: false, message: 'User already exists' });
+        const [rows] = await db.execute('SELECT phone FROM users WHERE phone = ?', [phone]);
+        if (rows.length > 0) return res.status(400).json({ status: false, message: 'User already exists' });
 
         const hashedPassword = await bcrypt.hash(password, 10);
-        const insert = db.prepare('INSERT INTO users (phone, password, balance) VALUES (?, ?, ?)');
-        insert.run(phone, hashedPassword, 0.0);
+        await db.execute('INSERT INTO users (phone, password, balance) VALUES (?, ?, ?)', [phone, hashedPassword, 0.0]);
+        
         res.json({ status: true, message: 'Registration successful' });
     } catch (e) {
         console.error('Registration Error:', e);
@@ -270,7 +280,8 @@ app.post('/api/login', async (req, res) => {
     if (!phone || !password) return res.status(400).json({ status: false, message: 'Missing phone or password' });
 
     try {
-        const user = db.prepare('SELECT * FROM users WHERE phone = ?').get(phone);
+        const [rows] = await db.execute('SELECT * FROM users WHERE phone = ?', [phone]);
+        const user = rows[0];
         const isMatch = user ? await bcrypt.compare(password, user.password) : false;
 
         if (!isMatch) {
@@ -321,7 +332,7 @@ app.post('/api/deposit', async (req, res) => {
 
 // ─── PAYSTACK WEBHOOK ────────────────────────────────────────────────────────
 // This endpoint receives confirmation from Paystack when the user enters their PIN.
-app.post('/api/webhook', (req, res) => {
+app.post('/api/webhook', async (req, res) => {
     const secret = process.env.PAYSTACK_SECRET_KEY;
     
     // Verify that the request actually came from Paystack
@@ -340,20 +351,18 @@ app.post('/api/webhook', (req, res) => {
         const phone = data.metadata?.phone;
 
         if (phone) {
-            const upsert = db.prepare(`
-                INSERT INTO users (phone, balance) VALUES (?, ?)
-                ON CONFLICT(phone) DO UPDATE SET balance = balance + ?
-            `);
-            const result = upsert.run(phone, amount, amount);
+            await db.execute(`
+                INSERT INTO users (phone, balance) VALUES (?, ?) 
+                ON DUPLICATE KEY UPDATE balance = balance + ?
+            `, [phone, amount, amount]);
             
             // Fetch the updated balance to send back to the user
-            const row = db.prepare('SELECT balance FROM users WHERE phone = ?').get(phone);
-            console.log(`[WEBHOOK] Successfully credited KES ${amount} to ${phone}. New balance: ${row.balance}`);
+            const [rows] = await db.execute('SELECT balance FROM users WHERE phone = ?', [phone]);
+            console.log(`[WEBHOOK] Successfully credited KES ${amount} to ${phone}. New balance: ${rows[0].balance}`);
 
-            // Notify the specific user via Socket.io if they are online
             const socketId = activeUsers.get(phone);
             if (socketId) {
-                io.to(socketId).emit('balanceUpdate', { balance: row.balance });
+                io.to(socketId).emit('balanceUpdate', { balance: rows[0].balance });
             }
         }
     }
@@ -368,7 +377,7 @@ startCycle();
 process.on('SIGINT', () => {
     console.log('Shutting down server...');
     clearInterval(gameLoopInterval);
-    db.close(); // Ensure SQLite handles are released safely
+    if (db) db.end(); // Close MySQL pool
     process.exit(0);
 });
 
