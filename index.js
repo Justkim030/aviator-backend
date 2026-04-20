@@ -4,7 +4,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const axios = require('axios');
-const mysql = require('mysql2/promise');
+const { Pool } = require('pg');
 const crypto = require('crypto');
 const bcrypt = require('bcrypt');
 const path = require('path');
@@ -23,29 +23,37 @@ const io = new Server(server, {
 // ─── DATABASE SETUP ──────────────────────────────────────────────────────────
 let db;
 async function initDB() {
-    db = await mysql.createPool({
-        host: process.env.DB_HOST,
-        user: process.env.DB_USER,
-        password: process.env.DB_PASS,
-        database: process.env.DB_NAME,
-        waitForConnections: true,
-        connectionLimit: 10,
-        queueLimit: 0
+    // Render automatically provides DATABASE_URL for PostgreSQL
+    const connectionString = process.env.DATABASE_URL;
+
+    if (!connectionString) {
+        console.error('[DATABASE] Fatal: DATABASE_URL environment variable is not set.');
+        process.exit(1);
+    }
+
+    db = new Pool({
+        connectionString,
+        ssl: {
+            rejectUnauthorized: false // Required for Render's managed PostgreSQL
+        }
     });
 
     // Initialize tables
-    await db.execute(`
+    await db.query(`
         CREATE TABLE IF NOT EXISTS users (
             phone VARCHAR(20) PRIMARY KEY,
             password VARCHAR(255),
             balance DECIMAL(15, 2) DEFAULT 0.00
         )
     `);
-    console.log('MySQL Connected and Tables Initialized');
+    const host = connectionString.split('@')[1].split(':')[0];
+    console.log(`[DATABASE] Connected to ${host} and Tables Initialized`);
+    // Start the first game cycle ONLY after the database is ready
+    startCycle();
 }
 
 initDB().catch(err => {
-    console.error('Failed to connect to MySQL:', err);
+    console.error('[DATABASE] Fatal Connection Error:', err.code || err.message);
     process.exit(1);
 });
 
@@ -190,22 +198,22 @@ io.on('connection', (socket) => {
         if (isNaN(betAmount) || betAmount <= 0) return socket.emit('betError', 'Invalid bet amount.');
 
         try {
-            const [rows] = await db.execute('SELECT balance FROM users WHERE phone = ?', [socket.phone]);
-            const user = rows[0];
+            const result = await db.query('SELECT balance FROM users WHERE phone = $1', [socket.phone]);
+            const user = result.rows[0];
 
             if (!user || Number(user.balance) < betAmount) {
                 return socket.emit('betError', 'Insufficient balance.');
             }
 
             // 1. Deduct from Database immediately
-            await db.execute('UPDATE users SET balance = balance - ? WHERE phone = ?', [betAmount, socket.phone]);
+            await db.query('UPDATE users SET balance = balance - $1 WHERE phone = $2', [betAmount, socket.phone]);
             
             // 2. Track bet in memory for the duration of the flight
             activeBets.set(socket.id, { phone: socket.phone, amount: betAmount, status: 'active' });
             
             // 3. Notify user and others
             const newBal = Number(user.balance) - betAmount;
-            socket.emit('balanceUpdate', { balance: newBal });
+            socket.emit('balanceUpdate', { balance: parseFloat(newBal) });
             io.emit('playerBet', { user: socket.phone.replace(/(\d{3})\d+(\d{3})/, '$1***$2'), amount: betAmount });
             
             console.log(`Bet placed: ${socket.phone} - KES ${betAmount}`);
@@ -222,19 +230,19 @@ io.on('connection', (socket) => {
 
         try {
             const currentMult = gameState.multiplier;
-            const winAmount = parseFloat((bet.amount * currentMult).toFixed(2));
+            const winAmount = Number((bet.amount * currentMult).toFixed(2));
 
             // 1. Mark as cashed out so they can't double-click
             bet.status = 'cashed';
             activeBets.delete(socket.id);
 
             // 2. Update Database
-            await db.execute('UPDATE users SET balance = balance + ? WHERE phone = ?', [winAmount, socket.phone]);
+            await db.query('UPDATE users SET balance = balance + $1 WHERE phone = $2', [winAmount, socket.phone]);
             
             // 3. Fetch final balance to sync UI
-            const [rows] = await db.execute('SELECT balance FROM users WHERE phone = ?', [socket.phone]);
+            const result = await db.query('SELECT balance FROM users WHERE phone = $1', [socket.phone]);
             
-            socket.emit('balanceUpdate', { balance: rows[0].balance });
+            socket.emit('balanceUpdate', { balance: Number(result.rows[0].balance) });
             socket.emit('cashOutSuccess', { win: winAmount, multiplier: currentMult });
             
             io.emit('playerCashOut', { 
@@ -262,11 +270,11 @@ app.post('/api/register', async (req, res) => {
     if (!phone || !password) return res.status(400).json({ status: false, message: 'Missing phone or password' });
 
     try {
-        const [rows] = await db.execute('SELECT phone FROM users WHERE phone = ?', [phone]);
-        if (rows.length > 0) return res.status(400).json({ status: false, message: 'User already exists' });
+        const check = await db.query('SELECT phone FROM users WHERE phone = $1', [phone]);
+        if (check.rows.length > 0) return res.status(400).json({ status: false, message: 'User already exists' });
 
         const hashedPassword = await bcrypt.hash(password, 10);
-        await db.execute('INSERT INTO users (phone, password, balance) VALUES (?, ?, ?)', [phone, hashedPassword, 0.0]);
+        await db.query('INSERT INTO users (phone, password, balance) VALUES ($1, $2, $3)', [phone, hashedPassword, 0.0]);
         
         res.json({ status: true, message: 'Registration successful' });
     } catch (e) {
@@ -280,8 +288,8 @@ app.post('/api/login', async (req, res) => {
     if (!phone || !password) return res.status(400).json({ status: false, message: 'Missing phone or password' });
 
     try {
-        const [rows] = await db.execute('SELECT * FROM users WHERE phone = ?', [phone]);
-        const user = rows[0];
+        const result = await db.query('SELECT * FROM users WHERE phone = $1', [phone]);
+        const user = result.rows[0];
         const isMatch = user ? await bcrypt.compare(password, user.password) : false;
 
         if (!isMatch) {
@@ -289,7 +297,7 @@ app.post('/api/login', async (req, res) => {
         }
         res.json({ 
             status: true, 
-            user: { phone: user.phone, balance: user.balance } 
+            user: { phone: user.phone, balance: Number(user.balance) } 
         });
     } catch (e) {
         console.error('Login Error:', e);
@@ -351,18 +359,20 @@ app.post('/api/webhook', async (req, res) => {
         const phone = data.metadata?.phone;
 
         if (phone) {
-            await db.execute(`
-                INSERT INTO users (phone, balance) VALUES (?, ?) 
-                ON DUPLICATE KEY UPDATE balance = balance + ?
+            await db.query(`
+                INSERT INTO users (phone, balance) VALUES ($1, $2) 
+                ON CONFLICT (phone) DO UPDATE SET balance = users.balance + $3
             `, [phone, amount, amount]);
             
             // Fetch the updated balance to send back to the user
-            const [rows] = await db.execute('SELECT balance FROM users WHERE phone = ?', [phone]);
-            console.log(`[WEBHOOK] Successfully credited KES ${amount} to ${phone}. New balance: ${rows[0].balance}`);
+            const result = await db.query('SELECT balance FROM users WHERE phone = $1', [phone]);
+            const updatedBalance = Number(result.rows[0].balance);
+            
+            console.log(`[WEBHOOK] Successfully credited KES ${amount} to ${phone}. New balance: ${updatedBalance}`);
 
             const socketId = activeUsers.get(phone);
             if (socketId) {
-                io.to(socketId).emit('balanceUpdate', { balance: rows[0].balance });
+                io.to(socketId).emit('balanceUpdate', { balance: updatedBalance });
             }
         }
     }
@@ -370,14 +380,11 @@ app.post('/api/webhook', async (req, res) => {
     res.status(200).send('OK');
 });
 
-// Start the first game cycle
-startCycle();
-
 // ─── GRACEFUL SHUTDOWN ───────────────────────────────────────────────────────
 process.on('SIGINT', () => {
     console.log('Shutting down server...');
     clearInterval(gameLoopInterval);
-    if (db) db.end(); // Close MySQL pool
+    if (db) db.end(); // Close PostgreSQL pool
     process.exit(0);
 });
 
