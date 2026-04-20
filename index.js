@@ -202,7 +202,7 @@ io.on('connection', (socket) => {
         }
         if (!socket.phone) return socket.emit('betError', 'Please login to bet.');
 
-        const betAmount = Math.floor(Number(amount)); // Ensure integer for currency safety
+        const betAmount = Number(Number(amount).toFixed(2)); // Support decimal bets for KES
         if (activeBets.has(socket.id)) return socket.emit('betError', 'Bet already placed for this round.');
         if (isNaN(betAmount) || betAmount <= 0) return socket.emit('betError', 'Invalid bet amount.');
 
@@ -222,7 +222,7 @@ io.on('connection', (socket) => {
             
             // 3. Notify user and others
             const newBal = Number(user.balance) - betAmount;
-            socket.emit('balanceUpdate', { balance: parseFloat(newBal) });
+            socket.emit('balanceUpdate', { balance: Number(newBal) });
             io.emit('playerBet', { user: socket.phone.replace(/(\d{3})\d+(\d{3})/, '$1***$2'), amount: betAmount });
             
             console.log(`Bet placed: ${socket.phone} - KES ${betAmount}`);
