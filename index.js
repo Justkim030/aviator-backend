@@ -375,7 +375,7 @@ app.post('/api/webhook', async (req, res) => {
             
             // Fetch the updated balance to send back to the user
             const result = await db.query('SELECT balance FROM users WHERE phone = $1', [phone]);
-            const updatedBalance = Number(result.rows[0].balance);
+            const updatedBalance = Number(result.rows[0].balance || 0);
             
             console.log(`[WEBHOOK] Successfully credited KES ${amount} to ${phone}. New balance: ${updatedBalance}`);
 
@@ -390,12 +390,14 @@ app.post('/api/webhook', async (req, res) => {
 });
 
 // ─── GRACEFUL SHUTDOWN ───────────────────────────────────────────────────────
-process.on('SIGINT', () => {
-    console.log('Shutting down server...');
+const shutdown = () => {
+    console.log('[SERVER] Shutting down gracefully...');
     clearInterval(gameLoopInterval);
     if (db) db.end(); // Close PostgreSQL pool
     process.exit(0);
-});
+};
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown); // Required for Render/Cloud environments
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
