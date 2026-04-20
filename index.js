@@ -31,14 +31,17 @@ async function initDB() {
         process.exit(1);
     }
 
-    // We strip query params to ensure our manual SSL configuration is respected
-    const connectionString = rawUrl.split('?')[0];
+    // Use the URL object for safe host extraction and robust credential handling
+    const dbUrl = new URL(rawUrl);
 
     db = new Pool({
-        connectionString,
-        ssl: {
-            rejectUnauthorized: false // Required for Render's managed PostgreSQL
-        }
+        user: decodeURIComponent(dbUrl.username),
+        password: decodeURIComponent(dbUrl.password),
+        host: dbUrl.hostname,
+        port: dbUrl.port,
+        database: dbUrl.pathname.split('/')[1] || 'defaultdb',
+        ssl: { rejectUnauthorized: false },
+        max: 20 // Connection pooling for high-frequency betting
     });
 
     // Initialize tables
@@ -50,16 +53,15 @@ async function initDB() {
         )
     `);
 
-    // Use the URL object for safe host extraction (avoids password split bugs)
-    const dbUrl = new URL(rawUrl);
-    console.log(`[DATABASE] Success: Connected to ${dbUrl.hostname}`);
+    console.log(`[DATABASE] Success: Connected to ${dbUrl.hostname} (PostgreSQL)`);
     
     // Start the first game cycle ONLY after the database is ready
     startCycle();
 }
 
 initDB().catch(err => {
-    const hint = err.code === '28P01' ? ' (Check your password/credentials)' : '';
+    const isAuthError = err.code === '28P01' || err.message.includes('password authentication');
+    const hint = isAuthError ? ' (Check your password in Render Env Variables)' : '';
     console.error(`[DATABASE] Fatal Connection Error: ${err.code || err.message}${hint}`);
     process.exit(1);
 });
@@ -395,7 +397,7 @@ process.on('SIGINT', () => {
     process.exit(0);
 });
 
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
     console.log(`Aviator Server running on port ${PORT}`);
 });
