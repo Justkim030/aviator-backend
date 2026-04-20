@@ -221,7 +221,7 @@ io.on('connection', (socket) => {
             activeBets.set(socket.id, { phone: socket.phone, amount: betAmount, status: 'active' });
             
             // 3. Notify user and others
-            const newBal = Number((Number(user.balance || 0) - betAmount).toFixed(2));
+            const newBal = Number((Number(user.balance || 0) - betAmount).toFixed(2)); // Ensure 2 decimal places
             socket.emit('balanceUpdate', { balance: Number(newBal) });
             io.emit('playerBet', { user: socket.phone.replace(/(\d{3})\d+(\d{3})/, '$1***$2'), amount: betAmount });
             
