@@ -275,7 +275,8 @@ io.on('connection', (socket) => {
 
 // ─── AUTH API ────────────────────────────────────────────────────────────────
 app.post('/api/register', async (req, res) => {
-    const { phone, password } = req.body;
+    const phone = req.body.phone?.trim();
+    const password = req.body.password;
     if (!phone || !password) return res.status(400).json({ status: false, message: 'Missing phone or password' });
 
     try {
@@ -293,7 +294,8 @@ app.post('/api/register', async (req, res) => {
 });
 
 app.post('/api/login', async (req, res) => {
-    const { phone, password } = req.body;
+    const phone = req.body.phone?.trim();
+    const password = req.body.password;
     if (!phone || !password) return res.status(400).json({ status: false, message: 'Missing phone or password' });
 
     try {
