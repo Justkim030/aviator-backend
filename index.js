@@ -24,7 +24,9 @@ const io = new Server(server, {
 let db;
 async function initDB() {
     // Render automatically provides DATABASE_URL for PostgreSQL
-    const connectionString = process.env.DATABASE_URL;
+    // Aiven URLs often contain ?sslmode=require which forces strict CA verification.
+    // We strip it to ensure our rejectUnauthorized: false setting is respected.
+    const connectionString = process.env.DATABASE_URL ? process.env.DATABASE_URL.split('?')[0] : null;
 
     if (!connectionString) {
         console.error('[DATABASE] Fatal: DATABASE_URL environment variable is not set.');
@@ -388,7 +390,7 @@ process.on('SIGINT', () => {
     process.exit(0);
 });
 
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
     console.log(`Aviator Server running on port ${PORT}`);
 });
