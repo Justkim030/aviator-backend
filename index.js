@@ -221,7 +221,7 @@ io.on('connection', (socket) => {
             activeBets.set(socket.id, { phone: socket.phone, amount: betAmount, status: 'active' });
             
             // 3. Notify user and others
-            const newBal = Number(user.balance) - betAmount;
+            const newBal = Number((Number(user.balance) - betAmount).toFixed(2));
             socket.emit('balanceUpdate', { balance: Number(newBal) });
             io.emit('playerBet', { user: socket.phone.replace(/(\d{3})\d+(\d{3})/, '$1***$2'), amount: betAmount });
             
@@ -251,7 +251,7 @@ io.on('connection', (socket) => {
             // 3. Fetch final balance to sync UI
             const result = await db.query('SELECT balance FROM users WHERE phone = $1', [socket.phone]);
             
-            socket.emit('balanceUpdate', { balance: Number(result.rows[0].balance) });
+            socket.emit('balanceUpdate', { balance: Number(result.rows[0].balance || 0) });
             socket.emit('cashOutSuccess', { win: winAmount, multiplier: currentMult });
             
             io.emit('playerCashOut', { 
@@ -390,14 +390,14 @@ app.post('/api/webhook', async (req, res) => {
 });
 
 // ─── GRACEFUL SHUTDOWN ───────────────────────────────────────────────────────
-const shutdown = () => {
-    console.log('[SERVER] Shutting down gracefully...');
+const shutdown = (signal) => {
+    console.log(`[SERVER] Received ${signal}. Shutting down gracefully...`);
     clearInterval(gameLoopInterval);
     if (db) db.end(); // Close PostgreSQL pool
     process.exit(0);
 };
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown); // Required for Render/Cloud environments
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM')); // Required for Render/Cloud environments
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
