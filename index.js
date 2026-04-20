@@ -7,6 +7,8 @@ const axios = require('axios');
 const { DatabaseSync } = require('node:sqlite');
 const crypto = require('crypto');
 const bcrypt = require('bcrypt');
+const path = require('path');
+const fs = require('fs');
 
 const app = express();
 app.use(cors({ origin: process.env.FRONTEND_URL || "*" }));
@@ -19,7 +21,15 @@ const io = new Server(server, {
 });
 
 // ─── DATABASE SETUP ──────────────────────────────────────────────────────────
-const db = new DatabaseSync(process.env.DB_PATH || './aviator.db');
+const dbPath = process.env.DB_PATH || path.join(__dirname, 'aviator.db');
+
+// Ensure directory exists (useful for persistent volume mounts)
+const dbDir = path.dirname(dbPath);
+if (!fs.existsSync(dbDir)) {
+    fs.mkdirSync(dbDir, { recursive: true });
+}
+
+const db = new DatabaseSync(dbPath);
 
 // Initialize tables
 db.exec(`
@@ -353,6 +363,14 @@ app.post('/api/webhook', (req, res) => {
 
 // Start the first game cycle
 startCycle();
+
+// ─── GRACEFUL SHUTDOWN ───────────────────────────────────────────────────────
+process.on('SIGINT', () => {
+    console.log('Shutting down server...');
+    clearInterval(gameLoopInterval);
+    db.close(); // Ensure SQLite handles are released safely
+    process.exit(0);
+});
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
