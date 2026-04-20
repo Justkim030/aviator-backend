@@ -24,14 +24,15 @@ const io = new Server(server, {
 let db;
 async function initDB() {
     // Render automatically provides DATABASE_URL for PostgreSQL
-    // Aiven URLs often contain ?sslmode=require which forces strict CA verification.
-    // We strip it to ensure our rejectUnauthorized: false setting is respected.
-    const connectionString = process.env.DATABASE_URL ? process.env.DATABASE_URL.split('?')[0] : null;
+    const rawUrl = process.env.DATABASE_URL;
 
-    if (!connectionString) {
-        console.error('[DATABASE] Fatal: DATABASE_URL environment variable is not set.');
+    if (!rawUrl) {
+        console.error('[DATABASE] Fatal: DATABASE_URL is not defined in Environment Variables.');
         process.exit(1);
     }
+
+    // We strip query params to ensure our manual SSL configuration is respected
+    const connectionString = rawUrl.split('?')[0];
 
     db = new Pool({
         connectionString,
@@ -48,14 +49,18 @@ async function initDB() {
             balance DECIMAL(15, 2) DEFAULT 0.00
         )
     `);
-    const host = connectionString.split('@')[1].split(':')[0];
-    console.log(`[DATABASE] Connected to ${host} and Tables Initialized`);
+
+    // Use the URL object for safe host extraction (avoids password split bugs)
+    const dbUrl = new URL(rawUrl);
+    console.log(`[DATABASE] Success: Connected to ${dbUrl.hostname}`);
+    
     // Start the first game cycle ONLY after the database is ready
     startCycle();
 }
 
 initDB().catch(err => {
-    console.error('[DATABASE] Fatal Connection Error:', err.code || err.message);
+    const hint = err.code === '28P01' ? ' (Check your password/credentials)' : '';
+    console.error(`[DATABASE] Fatal Connection Error: ${err.code || err.message}${hint}`);
     process.exit(1);
 });
 
@@ -390,7 +395,7 @@ process.on('SIGINT', () => {
     process.exit(0);
 });
 
-const PORT = process.env.PORT || 10000;
+const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
     console.log(`Aviator Server running on port ${PORT}`);
 });
