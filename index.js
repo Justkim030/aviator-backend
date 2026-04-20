@@ -397,7 +397,7 @@ process.on('SIGINT', () => {
     process.exit(0);
 });
 
-const PORT = process.env.PORT || 10000;
+const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
     console.log(`Aviator Server running on port ${PORT}`);
 });
