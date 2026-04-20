@@ -31,10 +31,6 @@ async function initDB() {
         process.exit(1);
     }
 
-    if (!process.env.PAYSTACK_SECRET_KEY) {
-        console.warn('[WARN] PAYSTACK_SECRET_KEY is not defined. Deposits will not work.');
-    }
-
     // Use the URL object for safe host extraction and robust credential handling
     const dbUrl = new URL(rawUrl);
 
@@ -226,7 +222,7 @@ io.on('connection', (socket) => {
             
             // 3. Notify user and others
             const newBal = Number(user.balance) - betAmount;
-            socket.emit('balanceUpdate', { balance: Number(newBal) });
+            socket.emit('balanceUpdate', { balance: parseFloat(newBal) });
             io.emit('playerBet', { user: socket.phone.replace(/(\d{3})\d+(\d{3})/, '$1***$2'), amount: betAmount });
             
             console.log(`Bet placed: ${socket.phone} - KES ${betAmount}`);
@@ -394,15 +390,16 @@ app.post('/api/webhook', async (req, res) => {
 });
 
 // ─── GRACEFUL SHUTDOWN ───────────────────────────────────────────────────────
-const shutdown = (signal) => {
-    console.log(`[SERVER] Received ${signal}. Shutting down gracefully...`);
+const shutdown = () => {
+    console.log('[SERVER] Shutting down gracefully...');
     clearInterval(gameLoopInterval);
     if (db) db.end(); // Close PostgreSQL pool
     process.exit(0);
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('SIGTERM', () => shutdown('SIGTERM')); // Required for Render/Cloud environments
+};
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown); // Required for Render/Cloud environments
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
     console.log(`Aviator Server running on port ${PORT}`);
-});}
+});
