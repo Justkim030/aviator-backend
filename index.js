@@ -11,6 +11,7 @@ const path = require('path');
 const fs = require('fs');
 const jwt = require('jsonwebtoken');
 const winston = require('winston');
+const rateLimit = require('express-rate-limit');
 
 // ─── LOGGING SETUP ──────────────────────────────────────────────────────────
 const logger = winston.createLogger({
@@ -33,10 +34,29 @@ app.use(cors({
 }));
 app.use(express.json());
 
+// ─── RATE LIMITING ──────────────────────────────────────────────────────────
+const apiLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 100,
+    message: { status: false, message: 'Too many requests, please try again later.' }
+});
+
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 5,
+    message: { status: false, message: 'Too many attempts. Please try again in 15 mins.' }
+});
+
+// Apply to sensitive routes
+app.use('/api/login', authLimiter);
+app.use('/api/register', authLimiter);
+app.use('/api/deposit', apiLimiter);
+
 const JWT_SECRET = process.env.JWT_SECRET; // Removed fallback to force env variable usage
 if (!JWT_SECRET) logger.error("JWT_SECRET is missing from environment variables!");
 
 const server = http.createServer(app);
+const PORT = process.env.PORT || 3001;
 const io = new Server(server, {
     cors: { origin: allowedOrigin },
     transports: ['websocket']
@@ -338,7 +358,7 @@ io.on('connection', (socket) => {
 });
 
 // ─── AUTH API ────────────────────────────────────────────────────────────────
-app.post('/api/register', async (req, res) => {
+app.post('/api/register', authLimiter, async (req, res) => {
     const phone = req.body.phone?.trim();
     const password = req.body.password;
     if (!phone || !password) return res.status(400).json({ status: false, message: 'Missing phone or password' });
@@ -357,7 +377,7 @@ app.post('/api/register', async (req, res) => {
     }
 });
 
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', authLimiter, async (req, res) => {
     const phone = req.body.phone?.trim();
     const password = req.body.password;
     if (!phone || !password) return res.status(400).json({ status: false, message: 'Missing phone or password' });
