@@ -27,6 +27,10 @@ const logger = winston.createLogger({
 });
 
 const app = express();
+
+// Required for express-rate-limit to work behind Render's proxy
+app.set('trust proxy', 1);
+
 const allowedOrigin = process.env.FRONTEND_URL || "http://localhost:5173";
 app.use(cors({ 
     origin: allowedOrigin,
@@ -408,6 +412,12 @@ app.post('/api/login', authLimiter, async (req, res) => {
 app.post('/api/deposit', async (req, res) => {
     const { amount, phone, email } = req.body;
 
+    // Format phone number to 254... format for Paystack
+    let formattedPhone = phone.trim().replace('+', '');
+    if (formattedPhone.startsWith('0')) {
+        formattedPhone = '254' + formattedPhone.slice(1);
+    }
+
     try {
         // Using Paystack Charge API for M-Pesa STK Push
         const response = await axios.post(
@@ -416,9 +426,9 @@ app.post('/api/deposit', async (req, res) => {
                 email: email || 'customer@example.com',
                 amount: amount * 100, // Paystack expects cents/kobo
                 currency: "KES",
-                metadata: { phone },
+                metadata: { phone: formattedPhone },
                 mobile_money: {
-                    phone: phone,
+                    phone: formattedPhone,
                     provider: "mpesa"
                 }
             },
