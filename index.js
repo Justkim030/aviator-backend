@@ -56,6 +56,7 @@ app.use('/api/login', authLimiter);
 app.use('/api/register', authLimiter);
 app.use('/api/deposit', apiLimiter);
 
+const ADMIN_PHONE = process.env.ADMIN_PHONE || '254700000000';
 const JWT_SECRET = process.env.JWT_SECRET; // Removed fallback to force env variable usage
 if (!JWT_SECRET) logger.error("JWT_SECRET is missing from environment variables!");
 
@@ -112,6 +113,7 @@ async function initDB() {
     logger.info(`[DATABASE] Success: Connected to ${dbUrl.hostname} (PostgreSQL)`);
     
     // Start the first game cycle ONLY after the database is ready
+    await runPhoneMigration();
     startCycle();
 }
 
@@ -156,6 +158,55 @@ function normalizePhone(phone) {
     if (p.startsWith('0')) p = '254' + p.slice(1);
     else if ((p.startsWith('7') || p.startsWith('1')) && p.length === 9) p = '254' + p;
     return p;
+}
+
+/**
+ * One-time migration to ensure all phone numbers follow the 2547XXXXXXXX format.
+ * This handles merging balances if a user registered twice with different formats.
+ */
+async function runPhoneMigration() {
+    const client = await db.connect();
+    try {
+        await client.query('BEGIN');
+        // Find users that need normalization (start with 0, or are 9 digits, or have a +)
+        const { rows: users } = await client.query("SELECT phone, balance FROM users WHERE phone LIKE '0%' OR LENGTH(phone) = 9 OR phone LIKE '+%'");
+        
+        for (const u of users) {
+            const norm = normalizePhone(u.phone);
+            if (norm === u.phone) continue;
+
+            const { rows: collisions } = await client.query('SELECT phone FROM users WHERE phone = $1', [norm]);
+            if (collisions.length > 0) {
+                // Collision found: Merge balance into the normalized account and delete the old one
+                await client.query('UPDATE users SET balance = balance + $1 WHERE phone = $2', [u.balance, norm]);
+                await client.query('DELETE FROM users WHERE phone = $1', [u.phone]);
+                logger.info(`[MIGRATION] Merged balance for ${u.phone} into ${norm}`);
+            } else {
+                // No collision: Just update the primary key to the new format
+                await client.query('UPDATE users SET phone = $1 WHERE phone = $2', [norm, u.phone]);
+                logger.info(`[MIGRATION] Updated ${u.phone} to ${norm}`);
+            }
+        }
+
+        // Normalize all historical transaction records in one batch SQL command
+        await client.query(`
+            UPDATE transactions 
+            SET phone = CASE 
+                WHEN regexp_replace(phone, '\\D', '', 'g') ~ '^0' THEN '254' || SUBSTRING(regexp_replace(phone, '\\D', '', 'g') FROM 2)
+                WHEN length(regexp_replace(phone, '\\D', '', 'g')) = 9 AND regexp_replace(phone, '\\D', '', 'g') ~ '^[71]' THEN '254' || regexp_replace(phone, '\\D', '', 'g')
+                ELSE regexp_replace(phone, '\\D', '', 'g')
+            END
+            WHERE phone LIKE '0%' OR LENGTH(phone) = 9 OR phone LIKE '+%'
+        `);
+
+        await client.query('COMMIT');
+        if (users.length > 0) logger.info(`[MIGRATION] Database normalization complete.`);
+    } catch (e) {
+        await client.query('ROLLBACK');
+        logger.error('[MIGRATION] Error during phone normalization:', e);
+    } finally {
+        client.release();
+    }
 }
 
 /**
@@ -219,7 +270,14 @@ function beginFlight() {
     
     const targetCrash = generateProvablyFairCrash(currentServerSeed, gameState.clientSeed, gameState.nonce);
     
-    logger.info(`[Round ${gameState.roundId}] Started. Target: ${targetCrash}x`);
+    // Look-ahead: Pre-calculate the next 5 crash points for monitoring
+    let upcoming = [];
+    for (let i = 1; i <= 5; i++) {
+        const nextCrash = generateProvablyFairCrash(currentServerSeed, gameState.clientSeed, gameState.nonce + i);
+        upcoming.push(`R${gameState.roundId + i}: ${nextCrash}x`);
+    }
+
+    logger.info(`[Round ${gameState.roundId}] Started. Target: ${targetCrash}x | Next 5: ${upcoming.join(' | ')}`);
     io.emit('flightStart', { startTime: gameState.startTime });
 
     gameLoopInterval = setInterval(() => {
@@ -473,7 +531,7 @@ app.post('/api/deposit', async (req, res) => {
         logger.error('STK Push Error:', { 
             error: paystackError, 
             details: error.response?.data,
-            phone: formattedPhone 
+            phone: paystackPhone 
         });
         res.status(500).json({ status: false, message: paystackError || 'Failed to initiate STK push' });
     }
@@ -521,6 +579,41 @@ app.post('/api/webhook', async (req, res) => {
     }
 
     res.status(200).send('OK');
+});
+
+// ─── ADMIN DASHBOARD ROUTE ──────────────────────────────────────────────────
+// Provides visibility into the next 50 crash points for monitoring and debugging.
+app.get('/api/admin/upcoming', async (req, res) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.status(401).json({ status: false, message: 'Unauthorized' });
+
+    const token = authHeader.split(' ')[1];
+    jwt.verify(token, JWT_SECRET, (err, decoded) => {
+        if (err || decoded.phone !== ADMIN_PHONE) {
+            return res.status(403).json({ status: false, message: 'Forbidden' });
+        }
+
+        const upcoming = [];
+        const count = 50;
+
+        for (let i = 1; i <= count; i++) {
+            const nextNonce = gameState.nonce + i;
+            const nextRoundId = gameState.roundId + i;
+            const crashPoint = generateProvablyFairCrash(currentServerSeed, gameState.clientSeed, nextNonce);
+            upcoming.push({
+                roundId: nextRoundId,
+                nonce: nextNonce,
+                crashMultiplier: crashPoint
+            });
+        }
+
+        res.json({
+            status: true,
+            serverSeedHash: gameState.serverSeedHash,
+            clientSeed: gameState.clientSeed,
+            upcoming
+        });
+    });
 });
 
 // ─── GRACEFUL SHUTDOWN ───────────────────────────────────────────────────────
