@@ -148,6 +148,17 @@ let gameLoopInterval = null;
 // ─── LOGIC ───────────────────────────────────────────────────────────────────
 
 /**
+ * Standardizes phone numbers to 2547XXXXXXXX format (no plus)
+ */
+function normalizePhone(phone) {
+    if (!phone) return '';
+    let p = phone.trim().replace(/\D/g, '');
+    if (p.startsWith('0')) p = '254' + p.slice(1);
+    else if ((p.startsWith('7') || p.startsWith('1')) && p.length === 9) p = '254' + p;
+    return p;
+}
+
+/**
  * Rotates the server seed if 24 hours have passed.
  */
 function refreshDailySeed() {
@@ -363,7 +374,7 @@ io.on('connection', (socket) => {
 
 // ─── AUTH API ────────────────────────────────────────────────────────────────
 app.post('/api/register', authLimiter, async (req, res) => {
-    const phone = req.body.phone?.trim();
+    const phone = normalizePhone(req.body.phone);
     const password = req.body.password;
     if (!phone || !password) return res.status(400).json({ status: false, message: 'Missing phone or password' });
 
@@ -382,7 +393,7 @@ app.post('/api/register', authLimiter, async (req, res) => {
 });
 
 app.post('/api/login', authLimiter, async (req, res) => {
-    const phone = req.body.phone?.trim();
+    const phone = normalizePhone(req.body.phone);
     const password = req.body.password;
     if (!phone || !password) return res.status(400).json({ status: false, message: 'Missing phone or password' });
 
@@ -421,27 +432,18 @@ app.post('/api/deposit', async (req, res) => {
         return res.status(500).json({ status: false, message: 'Payment provider not configured' });
     }
 
-    // Paystack M-Pesa in Kenya requires the international format: 2547XXXXXXXX or 2541XXXXXXXX
-    let formattedPhone = phone.trim().replace(/\D/g, ''); // Remove all non-digits
-    if (formattedPhone.startsWith('0')) {
-        // Convert 07... to 2547...
-        formattedPhone = '254' + formattedPhone.slice(1);
-    } else if ((formattedPhone.startsWith('7') || formattedPhone.startsWith('1')) && formattedPhone.length === 9) {
-        // Convert 7... to 2547...
-        formattedPhone = '254' + formattedPhone;
-    }
-
-    // Paystack M-Pesa in Kenya typically requires the + prefix: +2547XXXXXXXX
-    formattedPhone = '+' + formattedPhone;
+    const normalized = normalizePhone(phone);
+    // Paystack needs the + prefix for the actual STK push
+    const paystackPhone = '+' + normalized;
 
     // Strict final validation for Paystack M-Pesa format (+254 subscriber number)
-    if (!/^\+254(7|1)\d{8}$/.test(formattedPhone)) {
-        logger.error('[DEPOSIT] Final phone number format validation failed for Paystack', { originalPhone: phone, formattedPhone });
+    if (!/^\+254(7|1)\d{8}$/.test(paystackPhone)) {
+        logger.error('[DEPOSIT] Final phone number format validation failed for Paystack', { originalPhone: phone, paystackPhone });
         return res.status(400).json({ status: false, message: 'Invalid phone number. Use format +2547XXXXXXXX or 07XXXXXXXX.' });
     }
 
     // Generate a plausible email for Paystack receipt if not provided by client
-    const receiptEmail = `${formattedPhone}@aviator.game`;
+    const receiptEmail = `${normalized}@aviator.game`;
 
     try {
         // Using Paystack Charge API for M-Pesa STK Push
@@ -451,9 +453,9 @@ app.post('/api/deposit', async (req, res) => {
                 email: receiptEmail,
                 amount: amount * 100, // Paystack expects cents/kobo
                 currency: "KES",
-                metadata: { phone: formattedPhone },
+                metadata: { phone: normalized }, // Use normalized for internal matching
                 mobile_money: {
-                    phone: formattedPhone,
+                    phone: paystackPhone,
                     provider: "mpesa"
                 }
             },
@@ -495,7 +497,7 @@ app.post('/api/webhook', async (req, res) => {
 
     if (event === 'charge.success') {
         const amount = data.amount / 100; // Convert back from cents to KES
-        const phone = data.metadata?.phone;
+        const phone = normalizePhone(data.metadata?.phone);
 
         if (phone) {
             await db.query(`
