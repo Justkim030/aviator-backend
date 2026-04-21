@@ -410,20 +410,42 @@ app.post('/api/login', authLimiter, async (req, res) => {
 
 // ─── DEPOSIT API (REAL STK PUSH) ─────────────────────────────────────────────
 app.post('/api/deposit', async (req, res) => {
-    const { amount, phone, email } = req.body;
+    const { amount, phone } = req.body; // Removed email from destructuring
 
-    // Format phone number to 254... format for Paystack
-    let formattedPhone = phone.trim().replace('+', '');
-    if (formattedPhone.startsWith('0')) {
-        formattedPhone = '254' + formattedPhone.slice(1);
+    if (!amount || isNaN(amount) || amount < 50) {
+        return res.status(400).json({ status: false, message: 'Minimum deposit is KES 50' });
     }
+
+    if (!process.env.PAYSTACK_SECRET_KEY) {
+        logger.error('[DEPOSIT] PAYSTACK_SECRET_KEY is missing from environment variables');
+        return res.status(500).json({ status: false, message: 'Payment provider not configured' });
+    }
+
+    // Paystack M-Pesa usually expects the phone number in local format: 07XXXXXXXX or 01XXXXXXXX
+    let formattedPhone = phone.trim().replace(/\D/g, ''); // Remove all non-digits
+    if (formattedPhone.startsWith('254') && formattedPhone.length === 12) {
+        // Convert 2547... to 07...
+        formattedPhone = '0' + formattedPhone.slice(3);
+    } else if ((formattedPhone.startsWith('7') || formattedPhone.startsWith('1')) && formattedPhone.length === 9) {
+        // Convert 7... to 07...
+        formattedPhone = '0' + formattedPhone;
+    }
+
+    // Strict final validation for Paystack M-Pesa format
+    if (!/^(07|01)\d{8}$/.test(formattedPhone)) {
+        logger.error('[DEPOSIT] Final phone number format validation failed for Paystack', { originalPhone: phone, formattedPhone });
+        return res.status(400).json({ status: false, message: 'Invalid phone number format for M-Pesa. Please use a valid Kenyan mobile number (e.g., 07XXXXXXXX or 01XXXXXXXX).' });
+    }
+
+    // Generate a plausible email for Paystack receipt if not provided by client
+    const receiptEmail = `${formattedPhone}@aviator.game`;
 
     try {
         // Using Paystack Charge API for M-Pesa STK Push
         const response = await axios.post(
             'https://api.paystack.co/charge',
             {
-                email: email || 'customer@example.com',
+                email: receiptEmail,
                 amount: amount * 100, // Paystack expects cents/kobo
                 currency: "KES",
                 metadata: { phone: formattedPhone },
@@ -442,8 +464,13 @@ app.post('/api/deposit', async (req, res) => {
 
         res.json({ status: true, data: response.data });
     } catch (error) {
-        logger.error('STK Push Error:', error.response?.data || error.message);
-        res.status(500).json({ status: false, message: 'Failed to initiate STK push' });
+        const paystackError = error.response?.data?.message || error.message;
+        logger.error('STK Push Error:', { 
+            error: paystackError, 
+            details: error.response?.data,
+            phone: formattedPhone 
+        });
+        res.status(500).json({ status: false, message: paystackError || 'Failed to initiate STK push' });
     }
 });
 
