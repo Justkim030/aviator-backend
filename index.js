@@ -9,14 +9,36 @@ const crypto = require('crypto');
 const bcrypt = require('bcrypt');
 const path = require('path');
 const fs = require('fs');
+const jwt = require('jsonwebtoken');
+const winston = require('winston');
+
+// ─── LOGGING SETUP ──────────────────────────────────────────────────────────
+const logger = winston.createLogger({
+    level: 'info',
+    format: winston.format.combine(
+        winston.format.timestamp(),
+        winston.format.json()
+    ),
+    transports: [
+        new winston.transports.Console(),
+        // In production, these logs can be piped to services like Logtail or Datadog
+    ],
+});
 
 const app = express();
-app.use(cors({ origin: process.env.FRONTEND_URL || "*" }));
+const allowedOrigin = process.env.FRONTEND_URL || "http://localhost:5173";
+app.use(cors({ 
+    origin: allowedOrigin,
+    credentials: true // Required if you decide to use HttpOnly cookies for JWTs
+}));
 app.use(express.json());
+
+const JWT_SECRET = process.env.JWT_SECRET; // Removed fallback to force env variable usage
+if (!JWT_SECRET) logger.error("JWT_SECRET is missing from environment variables!");
 
 const server = http.createServer(app);
 const io = new Server(server, {
-    cors: { origin: process.env.FRONTEND_URL || "*" },
+    cors: { origin: allowedOrigin },
     transports: ['websocket']
 });
 
@@ -27,7 +49,7 @@ async function initDB() {
     const rawUrl = process.env.DATABASE_URL;
 
     if (!rawUrl) {
-        console.error('[DATABASE] Fatal: DATABASE_URL is not defined in Environment Variables.');
+        logger.error('[DATABASE] Fatal: DATABASE_URL is not defined in Environment Variables.');
         process.exit(1);
     }
 
@@ -52,8 +74,18 @@ async function initDB() {
             balance DECIMAL(15, 2) DEFAULT 0.00
         )
     `);
+    
+    await db.query(`
+        CREATE TABLE IF NOT EXISTS transactions (
+            id SERIAL PRIMARY KEY,
+            phone VARCHAR(20),
+            type VARCHAR(20), -- 'deposit', 'bet', 'win', 'withdrawal'
+            amount DECIMAL(15, 2),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    `);
 
-    console.log(`[DATABASE] Success: Connected to ${dbUrl.hostname} (PostgreSQL)`);
+    logger.info(`[DATABASE] Success: Connected to ${dbUrl.hostname} (PostgreSQL)`);
     
     // Start the first game cycle ONLY after the database is ready
     startCycle();
@@ -62,7 +94,7 @@ async function initDB() {
 initDB().catch(err => {
     const isAuthError = err.code === '28P01' || err.message.includes('password authentication');
     const hint = isAuthError ? ' (Check your password in Render Env Variables)' : '';
-    console.error(`[DATABASE] Fatal Connection Error: ${err.code || err.message}${hint}`);
+    logger.error(`[DATABASE] Fatal Connection Error: ${err.code || err.message}${hint}`);
     process.exit(1);
 });
 
@@ -86,9 +118,25 @@ let gameState = {
 };
 
 let currentServerSeed = '';
+let seedGeneratedAt = 0;
 let gameLoopInterval = null;
 
 // ─── LOGIC ───────────────────────────────────────────────────────────────────
+
+/**
+ * Rotates the server seed if 24 hours have passed.
+ */
+function refreshDailySeed() {
+    const now = Date.now();
+    const oneDay = 24 * 60 * 60 * 1000;
+
+    if (!currentServerSeed || (now - seedGeneratedAt) > oneDay) {
+        currentServerSeed = crypto.randomBytes(32).toString('hex');
+        gameState.serverSeedHash = crypto.createHash('sha256').update(currentServerSeed).digest('hex');
+        seedGeneratedAt = now;
+        logger.info('[FAIRNESS] New Daily Server Seed Generated.');
+    }
+}
 
 /**
  * Generates a crash point using HMAC-SHA256 (Provably Fair)
@@ -114,10 +162,7 @@ function startCycle() {
     gameState.nonce++;
     
     activeBets.clear(); // Clear bets from the previous round
-
-    // Generate new seeds for the round
-    currentServerSeed = crypto.randomBytes(32).toString('hex');
-    gameState.serverSeedHash = crypto.createHash('sha256').update(currentServerSeed).digest('hex');
+    refreshDailySeed(); // Ensure the seed is rotated daily
 
     const cd = setInterval(() => {
         gameState.countdown--;
@@ -139,19 +184,24 @@ function beginFlight() {
     
     const targetCrash = generateProvablyFairCrash(currentServerSeed, gameState.clientSeed, gameState.nonce);
     
-    console.log(`[Round ${gameState.roundId}] Started. Target: ${targetCrash}x`);
+    logger.info(`[Round ${gameState.roundId}] Started. Target: ${targetCrash}x`);
     io.emit('flightStart', { startTime: gameState.startTime });
 
     gameLoopInterval = setInterval(() => {
-        const elapsed = (Date.now() - gameState.startTime) / 1000;
-        // Exponential growth: 1.00 * e^(0.1 * t)
-        // This matches the curve logic mentioned in your visual breakdown
-        gameState.multiplier = Math.pow(Math.E, 0.12 * elapsed);
+        try {
+            const elapsed = (Date.now() - gameState.startTime) / 1000;
+            // Exponential growth: 1.00 * e^(0.1 * t)
+            // This matches the curve logic mentioned in your visual breakdown
+            gameState.multiplier = Math.pow(Math.E, 0.12 * elapsed);
 
-        if (gameState.multiplier >= targetCrash) {
-            endFlight();
-        } else {
-            io.emit('multiplierUpdate', { multiplier: gameState.multiplier });
+            if (gameState.multiplier >= targetCrash) {
+                endFlight();
+            } else {
+                io.emit('multiplierUpdate', { multiplier: gameState.multiplier });
+            }
+        } catch (err) {
+            logger.error(`[GAMELOOP] Error in Round ${gameState.roundId}:`, err);
+            endFlight(); // Safely end the flight if an error occurs
         }
     }, 50); // 20 updates per second for smooth rendering
 }
@@ -182,17 +232,20 @@ function endFlight() {
 
 // ─── SOCKET CONNECTION ───────────────────────────────────────────────────────
 io.on('connection', (socket) => {
-    console.log('User connected:', socket.id);
+    logger.info(`User connected: ${socket.id}`);
     // Send current game state to the new user so they sync immediately
     socket.emit('gameState', gameState);
 
-    // Register user by phone so we can send them targeted balance updates
-    socket.on('registerUser', (phone) => {
-        if (phone) {
-            socket.phone = phone; // Attach phone to socket for easier lookup
-            activeUsers.set(phone, socket.id);
-            console.log(`Socket ${socket.id} registered to phone ${phone}`);
-        }
+    // SECURITY: Authenticate socket connection via JWT
+    socket.on('authenticate', ({ phone, token }) => {
+        jwt.verify(token, JWT_SECRET, (err, decoded) => {
+            if (err || decoded.phone !== phone) {
+                return socket.emit('betError', 'Authentication failed. Please login again.');
+            }
+            socket.phone = decoded.phone;
+            activeUsers.set(decoded.phone, socket.id);
+            logger.info(`Socket ${socket.id} authenticated for ${decoded.phone}`);
+        });
     });
 
     // ─── BETTING LOGIC ───────────────────────────────────────────────────────
@@ -206,28 +259,35 @@ io.on('connection', (socket) => {
         if (activeBets.has(socket.id)) return socket.emit('betError', 'Bet already placed for this round.');
         if (isNaN(betAmount) || betAmount <= 0) return socket.emit('betError', 'Invalid bet amount.');
 
+        const client = await db.connect();
         try {
-            const result = await db.query('SELECT balance FROM users WHERE phone = $1', [socket.phone]);
+            await client.query('BEGIN');
+            
+            // Lock the user row for the duration of the transaction to prevent race conditions
+            const result = await client.query('SELECT balance FROM users WHERE phone = $1 FOR UPDATE', [socket.phone]);
             const user = result.rows[0];
 
             if (!user || Number(user.balance) < betAmount) {
+                await client.query('ROLLBACK');
                 return socket.emit('betError', 'Insufficient balance.');
             }
 
-            // 1. Deduct from Database immediately
-            await db.query('UPDATE users SET balance = balance - $1 WHERE phone = $2', [betAmount, socket.phone]);
+            await client.query('UPDATE users SET balance = balance - $1 WHERE phone = $2', [betAmount, socket.phone]);
+            await client.query('INSERT INTO transactions (phone, type, amount) VALUES ($1, $2, $3)', [socket.phone, 'bet', betAmount]);
+            await client.query('COMMIT');
             
-            // 2. Track bet in memory for the duration of the flight
             activeBets.set(socket.id, { phone: socket.phone, amount: betAmount, status: 'active' });
             
-            // 3. Notify user and others
-            const newBal = Number((Number(user.balance || 0) - betAmount).toFixed(2));
+            const newBal = Number((Number(user.balance) - betAmount).toFixed(2));
             socket.emit('balanceUpdate', { balance: Number(newBal) });
             io.emit('playerBet', { user: socket.phone.replace(/(\d{3})\d+(\d{3})/, '$1***$2'), amount: betAmount });
             
-            console.log(`Bet placed: ${socket.phone} - KES ${betAmount}`);
+            logger.info(`Bet placed: ${socket.phone} - KES ${betAmount}`);
         } catch (e) {
-            console.error('Bet placement error:', e);
+            await client.query('ROLLBACK');
+            logger.error('Bet placement error:', e);
+        } finally {
+            client.release();
         }
     });
 
@@ -237,19 +297,20 @@ io.on('connection', (socket) => {
         const bet = activeBets.get(socket.id);
         if (!bet || bet.status !== 'active') return socket.emit('betError', 'No active bet.');
 
+        const client = await db.connect();
         try {
+            await client.query('BEGIN');
             const currentMult = gameState.multiplier;
             const winAmount = Number((bet.amount * currentMult).toFixed(2));
 
-            // 1. Mark as cashed out so they can't double-click
             bet.status = 'cashed';
             activeBets.delete(socket.id);
 
-            // 2. Update Database
-            await db.query('UPDATE users SET balance = balance + $1 WHERE phone = $2', [winAmount, socket.phone]);
+            await client.query('UPDATE users SET balance = balance + $1 WHERE phone = $2', [winAmount, socket.phone]);
+            await client.query('INSERT INTO transactions (phone, type, amount) VALUES ($1, $2, $3)', [socket.phone, 'win', winAmount]);
             
-            // 3. Fetch final balance to sync UI
-            const result = await db.query('SELECT balance FROM users WHERE phone = $1', [socket.phone]);
+            const result = await client.query('SELECT balance FROM users WHERE phone = $1 FOR UPDATE', [socket.phone]);
+            await client.query('COMMIT');
             
             socket.emit('balanceUpdate', { balance: Number(result.rows[0].balance || 0) });
             socket.emit('cashOutSuccess', { win: winAmount, multiplier: currentMult });
@@ -260,12 +321,15 @@ io.on('connection', (socket) => {
                 win: winAmount 
             });
         } catch (e) {
-            console.error('Cashout error:', e);
+            await client.query('ROLLBACK');
+            logger.error('Cashout error:', e);
+        } finally {
+            client.release();
         }
     });
 
     socket.on('disconnect', () => {
-        console.log('User disconnected:', socket.id);
+        logger.info(`User disconnected: ${socket.id}`);
         // Optimized O(1) cleanup using the phone attached to the socket
         if (socket.phone && activeUsers.get(socket.phone) === socket.id) {
             activeUsers.delete(socket.phone);
@@ -288,7 +352,7 @@ app.post('/api/register', async (req, res) => {
         
         res.json({ status: true, message: 'Registration successful' });
     } catch (e) {
-        console.error('Registration Error:', e);
+        logger.error('Registration Error:', e);
         res.status(500).json({ status: false, message: 'Server error' });
     }
 });
@@ -306,12 +370,16 @@ app.post('/api/login', async (req, res) => {
         if (!isMatch) {
             return res.status(401).json({ status: false, message: 'Invalid phone or password' });
         }
+
+        // Generate JWT Token
+        const token = jwt.sign({ phone: user.phone }, JWT_SECRET, { expiresIn: '7d' });
+
         res.json({ 
             status: true, 
-            user: { phone: user.phone, balance: Number(user.balance) } 
+            user: { phone: user.phone, balance: Number(user.balance), token } 
         });
     } catch (e) {
-        console.error('Login Error:', e);
+        logger.error('Login Error:', e);
         res.status(500).json({ status: false, message: 'Server error' });
     }
 });
@@ -344,7 +412,7 @@ app.post('/api/deposit', async (req, res) => {
 
         res.json({ status: true, data: response.data });
     } catch (error) {
-        console.error('STK Push Error:', error.response?.data || error.message);
+        logger.error('STK Push Error:', error.response?.data || error.message);
         res.status(500).json({ status: false, message: 'Failed to initiate STK push' });
     }
 });
@@ -375,11 +443,13 @@ app.post('/api/webhook', async (req, res) => {
                 ON CONFLICT (phone) DO UPDATE SET balance = users.balance + $3
             `, [phone, amount, amount]);
             
+            await db.query('INSERT INTO transactions (phone, type, amount) VALUES ($1, $2, $3)', [phone, 'deposit', amount]);
+
             // Fetch the updated balance to send back to the user
             const result = await db.query('SELECT balance FROM users WHERE phone = $1', [phone]);
             const updatedBalance = Number(result.rows[0]?.balance || 0);
             
-            console.log(`[WEBHOOK] Successfully credited KES ${amount} to ${phone}. New balance: ${updatedBalance}`);
+            logger.info(`[WEBHOOK] Successfully credited KES ${amount} to ${phone}. New balance: ${updatedBalance}`);
 
             const socketId = activeUsers.get(phone);
             if (socketId) {
@@ -393,7 +463,7 @@ app.post('/api/webhook', async (req, res) => {
 
 // ─── GRACEFUL SHUTDOWN ───────────────────────────────────────────────────────
 const shutdown = (signal) => {
-    console.log(`[SERVER] Received ${signal}. Shutting down gracefully...`);
+    logger.info(`[SERVER] Received ${signal}. Shutting down gracefully...`);
     clearInterval(gameLoopInterval);
     if (db) db.end(); // Close PostgreSQL pool
     process.exit(0);
@@ -401,7 +471,6 @@ const shutdown = (signal) => {
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM')); // Required for Render/Cloud environments
 
-const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
-    console.log(`Aviator Server running on port ${PORT}`);
+    logger.info(`Aviator Server running on port ${PORT}`);
 });
