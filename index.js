@@ -412,8 +412,8 @@ app.post('/api/login', authLimiter, async (req, res) => {
 app.post('/api/deposit', async (req, res) => {
     const { amount, phone } = req.body; // Removed email from destructuring
 
-    if (!amount || isNaN(amount) || amount < 50) {
-        return res.status(400).json({ status: false, message: 'Minimum deposit is KES 50' });
+    if (!amount || isNaN(amount) || amount < 10) {
+        return res.status(400).json({ status: false, message: 'Minimum deposit is KES 10' });
     }
 
     if (!process.env.PAYSTACK_SECRET_KEY) {
