@@ -421,20 +421,20 @@ app.post('/api/deposit', async (req, res) => {
         return res.status(500).json({ status: false, message: 'Payment provider not configured' });
     }
 
-    // Paystack M-Pesa usually expects the phone number in local format: 07XXXXXXXX or 01XXXXXXXX
+    // Paystack M-Pesa in Kenya requires the international format: 2547XXXXXXXX or 2541XXXXXXXX
     let formattedPhone = phone.trim().replace(/\D/g, ''); // Remove all non-digits
-    if (formattedPhone.startsWith('254') && formattedPhone.length === 12) {
-        // Convert 2547... to 07...
-        formattedPhone = '0' + formattedPhone.slice(3);
+    if (formattedPhone.startsWith('0')) {
+        // Convert 07... to 2547...
+        formattedPhone = '254' + formattedPhone.slice(1);
     } else if ((formattedPhone.startsWith('7') || formattedPhone.startsWith('1')) && formattedPhone.length === 9) {
-        // Convert 7... to 07...
-        formattedPhone = '0' + formattedPhone;
+        // Convert 7... to 2547...
+        formattedPhone = '254' + formattedPhone;
     }
 
-    // Strict final validation for Paystack M-Pesa format
-    if (!/^(07|01)\d{8}$/.test(formattedPhone)) {
+    // Strict final validation for Paystack M-Pesa format (12 digits starting with 254)
+    if (!/^254(7|1)\d{8}$/.test(formattedPhone)) {
         logger.error('[DEPOSIT] Final phone number format validation failed for Paystack', { originalPhone: phone, formattedPhone });
-        return res.status(400).json({ status: false, message: 'Invalid phone number format for M-Pesa. Please use a valid Kenyan mobile number (e.g., 07XXXXXXXX or 01XXXXXXXX).' });
+        return res.status(400).json({ status: false, message: 'Invalid phone number. Use format 2547XXXXXXXX or 07XXXXXXXX.' });
     }
 
     // Generate a plausible email for Paystack receipt if not provided by client
