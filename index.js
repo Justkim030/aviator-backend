@@ -431,10 +431,13 @@ app.post('/api/deposit', async (req, res) => {
         formattedPhone = '254' + formattedPhone;
     }
 
-    // Strict final validation for Paystack M-Pesa format (12 digits starting with 254)
-    if (!/^254(7|1)\d{8}$/.test(formattedPhone)) {
+    // Paystack M-Pesa in Kenya typically requires the + prefix: +2547XXXXXXXX
+    formattedPhone = '+' + formattedPhone;
+
+    // Strict final validation for Paystack M-Pesa format (+254 subscriber number)
+    if (!/^\+254(7|1)\d{8}$/.test(formattedPhone)) {
         logger.error('[DEPOSIT] Final phone number format validation failed for Paystack', { originalPhone: phone, formattedPhone });
-        return res.status(400).json({ status: false, message: 'Invalid phone number. Use format 2547XXXXXXXX or 07XXXXXXXX.' });
+        return res.status(400).json({ status: false, message: 'Invalid phone number. Use format +2547XXXXXXXX or 07XXXXXXXX.' });
     }
 
     // Generate a plausible email for Paystack receipt if not provided by client
