@@ -161,6 +161,14 @@ function normalizePhone(phone) {
 }
 
 /**
+ * Masks a phone number for privacy (e.g., 254712345678 -> 2547****5678)
+ */
+function maskPhone(phone) {
+    if (!phone) return '';
+    return phone.replace(/(\d{4})\d+(\d{4})/, '$1****$2');
+}
+
+/**
  * One-time migration to ensure all phone numbers follow the 2547XXXXXXXX format.
  * This handles merging balances if a user registered twice with different formats.
  */
@@ -231,8 +239,10 @@ async function sendTalkSasaSMS(phone, message) {
             phone
         });
         logger.info(`[SMS] Attempted for ${phone}. Status: success. Ref: ${JSON.stringify(response.data)}`);
+        logger.info(`[SMS] Attempted for ${maskPhone(phone)}. Status: success.`);
     } catch (error) {
         logger.error(`[SMS] Attempted for ${phone}. Status: failure. Error: ${error.message}. Message: "${message}"`);
+        logger.error(`[SMS] Attempted for ${maskPhone(phone)}. Status: failure. Error: ${error.message}`);
     }
 }
 
@@ -647,6 +657,7 @@ app.post('/api/withdraw', authLimiter, async (req, res) => {
         // --- CUSTOMIZE THESE LABELS ---
         const brandName = "AVIATOR GAME"; 
         const accountLabel = phone; // You can change this to a username if you add a name column to your DB
+        const accountLabel = maskPhone(phone); 
 
         const smsContent = `Confirmed. Ksh${formattedAmount} has been sent to you from ${brandName} (Acc: ${accountLabel}) on ${formattedDate} at ${formattedTime}. Transaction ID: ${transactionId}.`;
         sendTalkSasaSMS(phone, smsContent);
