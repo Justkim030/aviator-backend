@@ -210,6 +210,33 @@ async function runPhoneMigration() {
 }
 
 /**
+ * Sends an SMS notification via TalkSasa API
+ * @param {string} phone - Formatted as 2547XXXXXXXX
+ * @param {string} message - Customizable message content
+ */
+async function sendTalkSasaSMS(phone, message) {
+    const apiKey = process.env.TALKSASA_API_KEY;
+    const senderId = process.env.TALKSASA_SENDER_ID || 'SASA_SMS';
+
+    if (!apiKey) {
+        logger.error('[SMS] TalkSasa API Key is missing');
+        return;
+    }
+
+    try {
+        const response = await axios.post('https://api.talksasa.com/v1/sms', {
+            apiKey,
+            senderId,
+            message,
+            phone
+        });
+        logger.info(`[SMS] Attempted for ${phone}. Status: success. Ref: ${JSON.stringify(response.data)}`);
+    } catch (error) {
+        logger.error(`[SMS] Attempted for ${phone}. Status: failure. Error: ${error.message}. Message: "${message}"`);
+    }
+}
+
+/**
  * Rotates the server seed if 24 hours have passed.
  */
 function refreshDailySeed() {
@@ -594,14 +621,35 @@ app.post('/api/withdraw', authLimiter, async (req, res) => {
         const result = await client.query('SELECT balance FROM users WHERE phone = $1 FOR UPDATE', [phone]);
         const user = result.rows[0];
 
-        if (!user || Number(user.balance) < amount) {
+        const withdrawalAmount = Number(amount);
+
+        if (!user || Number(user.balance) < withdrawalAmount) {
             await client.query('ROLLBACK');
             return res.status(400).json({ status: false, message: 'Insufficient balance' });
         }
 
-        await client.query('UPDATE users SET balance = balance - $1 WHERE phone = $2', [amount, phone]);
-        await client.query('INSERT INTO transactions (phone, type, amount) VALUES ($1, $2, $3)', [phone, 'withdrawal', amount]);
+        await client.query('UPDATE users SET balance = balance - $1 WHERE phone = $2', [withdrawalAmount, phone]);
+        const txResult = await client.query(
+            'INSERT INTO transactions (phone, type, amount) VALUES ($1, $2, $3) RETURNING id', 
+            [phone, 'withdrawal', withdrawalAmount]
+        );
+        const txRef = txResult.rows[0].id;
         await client.query('COMMIT');
+
+        // After successful commit, send SMS notification
+        const now = new Date();
+        const formattedDate = `${now.getDate()}/${now.getMonth() + 1}/${now.getFullYear().toString().slice(-2)}`;
+        const formattedTime = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+        const formattedAmount = withdrawalAmount.toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        const transactionId = crypto.randomBytes(4).toString('hex').toUpperCase() + txRef;
+
+        const smsContent = `Confirmed. Ksh${formattedAmount} has been sent to you from AVIATOR GAME (Acc: ${phone}) on ${formattedDate} at ${formattedTime}. Transaction ID: ${transactionId}.`;
+        // --- CUSTOMIZE THESE LABELS ---
+        const brandName = "AVIATOR GAME"; 
+        const accountLabel = phone; // You can change this to a username if you add a name column to your DB
+
+        const smsContent = `Confirmed. Ksh${formattedAmount} has been sent to you from ${brandName} (Acc: ${accountLabel}) on ${formattedDate} at ${formattedTime}. Transaction ID: ${transactionId}.`;
+        sendTalkSasaSMS(phone, smsContent);
 
         res.json({ status: true, message: 'Withdrawal request received and is being processed.' });
     } catch (e) {
