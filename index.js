@@ -127,7 +127,7 @@ initDB().catch(err => {
 // Map to track active connections: phone number -> socket ID
 const activeUsers = new Map();
 
-// Map to track current round bets: socketId -> { phone, amount, status }
+// Map to track current round bets: "phone_slotId" -> { phone, amount, status }
 let activeBets = new Map();
 
 // ─── GAME STATE ──────────────────────────────────────────────────────────────
@@ -373,6 +373,7 @@ io.on('connection', (socket) => {
             }
             socket.phone = decoded.phone;
             activeUsers.set(decoded.phone, socket.id);
+            socket.join(`user_${decoded.phone}`);
             logger.info(`Socket ${socket.id} authenticated for ${decoded.phone}`);
         });
     });
@@ -384,8 +385,10 @@ io.on('connection', (socket) => {
         }
         if (!socket.phone) return socket.emit('betError', 'Please login to bet.');
 
+        const slotId = req.slotId || 1;
         const betAmount = Number(Number(amount).toFixed(2)); // Support decimal bets for KES
-        if (activeBets.has(socket.id)) return socket.emit('betError', 'Bet already placed for this round.');
+        const betKey = `${socket.phone}_${slotId}`;
+        if (activeBets.has(betKey)) return socket.emit('betError', 'Bet already placed for this slot.');
         if (isNaN(betAmount) || betAmount <= 0) return socket.emit('betError', 'Invalid bet amount.');
 
         const client = await db.connect();
@@ -403,12 +406,13 @@ io.on('connection', (socket) => {
 
             await client.query('UPDATE users SET balance = balance - $1 WHERE phone = $2', [betAmount, socket.phone]);
             await client.query('INSERT INTO transactions (phone, type, amount) VALUES ($1, $2, $3)', [socket.phone, 'bet', betAmount]);
+            const balRes = await client.query('SELECT balance FROM users WHERE phone = $1', [socket.phone]);
             await client.query('COMMIT');
             
-            activeBets.set(socket.id, { phone: socket.phone, amount: betAmount, status: 'active' });
+            activeBets.set(betKey, { phone: socket.phone, amount: betAmount, status: 'active' });
             
-            const newBal = Number((Number(user.balance) - betAmount).toFixed(2));
-            socket.emit('balanceUpdate', { balance: Number(newBal) });
+            const updatedBal = Number(balRes.rows[0].balance);
+            io.to(`user_${socket.phone}`).emit('balanceUpdate', { balance: updatedBal });
             io.emit('playerBet', { user: socket.phone.replace(/(\d{3})\d+(\d{3})/, '$1***$2'), amount: betAmount });
             
             logger.info(`Bet placed: ${socket.phone} - KES ${betAmount}`);
@@ -420,10 +424,12 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('cashOut', async () => {
+    socket.on('cashOut', async ({ slotId }) => {
         if (gameState.phase !== 'flying') return socket.emit('betError', 'Not in flight.');
         
-        const bet = activeBets.get(socket.id);
+        const sid = slotId || 1;
+        const betKey = `${socket.phone}_${sid}`;
+        const bet = activeBets.get(betKey);
         if (!bet || bet.status !== 'active') return socket.emit('betError', 'No active bet.');
 
         const client = await db.connect();
@@ -433,7 +439,7 @@ io.on('connection', (socket) => {
             const winAmount = Number((bet.amount * currentMult).toFixed(2));
 
             bet.status = 'cashed';
-            activeBets.delete(socket.id);
+            activeBets.delete(betKey);
 
             await client.query('UPDATE users SET balance = balance + $1 WHERE phone = $2', [winAmount, socket.phone]);
             await client.query('INSERT INTO transactions (phone, type, amount) VALUES ($1, $2, $3)', [socket.phone, 'win', winAmount]);
@@ -441,7 +447,8 @@ io.on('connection', (socket) => {
             const result = await client.query('SELECT balance FROM users WHERE phone = $1 FOR UPDATE', [socket.phone]);
             await client.query('COMMIT');
             
-            socket.emit('balanceUpdate', { balance: Number(result.rows[0].balance || 0) });
+            const updatedBal = Number(result.rows[0].balance);
+            io.to(`user_${socket.phone}`).emit('balanceUpdate', { balance: updatedBal });
             socket.emit('cashOutSuccess', { win: winAmount, multiplier: currentMult });
             
             io.emit('playerCashOut', { 
@@ -607,10 +614,7 @@ app.post('/api/webhook', async (req, res) => {
             
             logger.info(`[WEBHOOK] Successfully credited KES ${amount} to ${phone}. New balance: ${updatedBalance}`);
 
-            const socketId = activeUsers.get(phone);
-            if (socketId) {
-                io.to(socketId).emit('balanceUpdate', { balance: updatedBalance });
-            }
+            io.to(`user_${phone}`).emit('balanceUpdate', { balance: updatedBalance });
         }
     }
 
