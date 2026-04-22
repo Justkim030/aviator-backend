@@ -232,17 +232,16 @@ async function sendTalkSasaSMS(phone, message) {
     }
 
     try {
-        const response = await axios.post('https://api.talksasa.com/v1/sms', {
-            apiKey,
-            senderId,
-            message,
-            phone
+        const response = await axios.post('https://talksasa.com/api/v3/sms/send', {
+            api_key: apiKey,
+            sender_id: senderId,
+            message: message,
+            phone: phone
         });
-        logger.info(`[SMS] Attempted for ${phone}. Status: success. Ref: ${JSON.stringify(response.data)}`);
         logger.info(`[SMS] Attempted for ${maskPhone(phone)}. Status: success.`);
     } catch (error) {
-        logger.error(`[SMS] Attempted for ${phone}. Status: failure. Error: ${error.message}. Message: "${message}"`);
-        logger.error(`[SMS] Attempted for ${maskPhone(phone)}. Status: failure. Error: ${error.message}`);
+        const errorDetail = error.response?.data?.message || error.message;
+        logger.error(`[SMS] Attempted for ${maskPhone(phone)}. Status: failure. Error: ${errorDetail}`);
     }
 }
 
