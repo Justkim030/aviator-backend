@@ -653,11 +653,8 @@ app.post('/api/withdraw', authLimiter, async (req, res) => {
         const formattedAmount = withdrawalAmount.toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
         const transactionId = crypto.randomBytes(4).toString('hex').toUpperCase() + txRef;
 
-        const smsContent = `Confirmed. Ksh${formattedAmount} has been sent to you from AVIATOR GAME (Acc: ${phone}) on ${formattedDate} at ${formattedTime}. Transaction ID: ${transactionId}.`;
-        // --- CUSTOMIZE THESE LABELS ---
         const brandName = "AVIATOR GAME"; 
         const accountLabel = maskPhone(phone); 
-
         const smsContent = `Confirmed. Ksh${formattedAmount} has been sent to you from ${brandName} (Acc: ${accountLabel}) on ${formattedDate} at ${formattedTime}. Transaction ID: ${transactionId}.`;
         sendTalkSasaSMS(phone, smsContent);
 
