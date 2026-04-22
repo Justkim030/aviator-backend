@@ -63,9 +63,8 @@ if (!JWT_SECRET) logger.error("JWT_SECRET is missing from environment variables!
 const server = http.createServer(app);
 const PORT = process.env.PORT || 3001;
 const io = new Server(server, {
-    cors: { origin: allowedOrigin, credentials: true },
-    transports: ['websocket', 'polling'],
-    allowUpgrades: true,
+    cors: { origin: allowedOrigin },
+    transports: ['websocket']
 });
 
 // ─── DATABASE SETUP ──────────────────────────────────────────────────────────
@@ -557,6 +556,62 @@ app.post('/api/webhook', async (req, res) => {
     if (event === 'charge.success') {
         const amount = data.amount / 100; // Convert back from cents to KES
         const phone = normalizePhone(data.metadata?.phone);
+
+        if (phone) {
+            await db.query(`
+                INSERT INTO users (phone, balance) VALUES ($1, $2) 
+                ON CONFLICT (phone) DO UPDATE SET balance = users.balance + $3
+            `, [phone, amount, amount]);
+            
+            await db.query('INSERT INTO transactions (phone, type, amount) VALUES ($1, $2, $3)', [phone, 'deposit', amount]);
+
+            // Fetch the updated balance to send back to the user
+            const result = await db.query('SELECT balance FROM users WHERE phone = $1', [phone]);
+            const updatedBalance = Number(result.rows[0]?.balance || 0);
+            
+            logger.info(`[WEBHOOK] Successfully credited KES ${amount} to ${phone}. New balance: ${updatedBalance}`);
+
+            const socketId = activeUsers.get(phone);
+            if (socketId) {
+                io.to(socketId).emit('balanceUpdate', { balance: updatedBalance });
+            }
+        }
+    }
+
+    res.status(200).send('OK');
+});
+
+// ─── WITHDRAWAL API ──────────────────────────────────────────────────────────
+app.post('/api/withdraw', authLimiter, async (req, res) => {
+    const { amount } = req.body;
+    const phone = normalizePhone(req.body.phone);
+
+    if (!amount || amount < 100) return res.status(400).json({ status: false, message: 'Minimum withdrawal is KES 100' });
+
+    const client = await db.connect();
+    try {
+        await client.query('BEGIN');
+        const result = await client.query('SELECT balance FROM users WHERE phone = $1 FOR UPDATE', [phone]);
+        const user = result.rows[0];
+
+        if (!user || Number(user.balance) < amount) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ status: false, message: 'Insufficient balance' });
+        }
+
+        await client.query('UPDATE users SET balance = balance - $1 WHERE phone = $2', [amount, phone]);
+        await client.query('INSERT INTO transactions (phone, type, amount) VALUES ($1, $2, $3)', [phone, 'withdrawal', amount]);
+        await client.query('COMMIT');
+
+        res.json({ status: true, message: 'Withdrawal request received and is being processed.' });
+    } catch (e) {
+        await client.query('ROLLBACK');
+        logger.error('Withdrawal error:', e);
+        res.status(500).json({ status: false, message: 'Server error' });
+    } finally {
+        client.release();
+    }
+});
 
         if (phone) {
             await db.query(`
