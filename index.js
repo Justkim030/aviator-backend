@@ -656,7 +656,6 @@ app.post('/api/withdraw', authLimiter, async (req, res) => {
         const smsContent = `Confirmed. Ksh${formattedAmount} has been sent to you from AVIATOR GAME (Acc: ${phone}) on ${formattedDate} at ${formattedTime}. Transaction ID: ${transactionId}.`;
         // --- CUSTOMIZE THESE LABELS ---
         const brandName = "AVIATOR GAME"; 
-        const accountLabel = phone; // You can change this to a username if you add a name column to your DB
         const accountLabel = maskPhone(phone); 
 
         const smsContent = `Confirmed. Ksh${formattedAmount} has been sent to you from ${brandName} (Acc: ${accountLabel}) on ${formattedDate} at ${formattedTime}. Transaction ID: ${transactionId}.`;
