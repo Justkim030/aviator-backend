@@ -613,30 +613,6 @@ app.post('/api/withdraw', authLimiter, async (req, res) => {
     }
 });
 
-        if (phone) {
-            await db.query(`
-                INSERT INTO users (phone, balance) VALUES ($1, $2) 
-                ON CONFLICT (phone) DO UPDATE SET balance = users.balance + $3
-            `, [phone, amount, amount]);
-            
-            await db.query('INSERT INTO transactions (phone, type, amount) VALUES ($1, $2, $3)', [phone, 'deposit', amount]);
-
-            // Fetch the updated balance to send back to the user
-            const result = await db.query('SELECT balance FROM users WHERE phone = $1', [phone]);
-            const updatedBalance = Number(result.rows[0]?.balance || 0);
-            
-            logger.info(`[WEBHOOK] Successfully credited KES ${amount} to ${phone}. New balance: ${updatedBalance}`);
-
-            const socketId = activeUsers.get(phone);
-            if (socketId) {
-                io.to(socketId).emit('balanceUpdate', { balance: updatedBalance });
-            }
-        }
-    }
-
-    res.status(200).send('OK');
-});
-
 // ─── ADMIN DASHBOARD ROUTE ──────────────────────────────────────────────────
 // Provides visibility into the next 50 crash points for monitoring and debugging.
 app.get('/api/admin/upcoming', async (req, res) => {
