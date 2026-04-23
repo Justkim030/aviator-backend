@@ -623,52 +623,64 @@ app.post('/api/webhook', async (req, res) => {
 
 // ─── WITHDRAWAL API ──────────────────────────────────────────────────────────
 app.post('/api/withdraw', authLimiter, async (req, res) => {
-    const { amount } = req.body;
-    const phone = normalizePhone(req.body.phone);
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.status(401).json({ status: false, message: 'Unauthorized' });
+    const token = authHeader.split(' ')[1];
 
-    if (!amount || amount < 100) return res.status(400).json({ status: false, message: 'Minimum withdrawal is KES 100' });
+    jwt.verify(token, JWT_SECRET, async (err, decoded) => {
+        if (err) return res.status(403).json({ status: false, message: 'Invalid session' });
+        
+        const { amount } = req.body;
+        const phone = normalizePhone(decoded.phone); // Always use the phone from the verified token
 
-    const client = await db.connect();
-    try {
-        await client.query('BEGIN');
-        const result = await client.query('SELECT balance FROM users WHERE phone = $1 FOR UPDATE', [phone]);
-        const user = result.rows[0];
+        if (!amount || amount < 100) return res.status(400).json({ status: false, message: 'Minimum withdrawal is KES 100' });
 
-        const withdrawalAmount = Number(amount);
+        const client = await db.connect();
+        try {
+            await client.query('BEGIN');
+            // FOR UPDATE locks the row to handle concurrent bets/withdrawals safely
+            const result = await client.query('SELECT balance FROM users WHERE phone = $1 FOR UPDATE', [phone]);
+            const user = result.rows[0];
 
-        if (!user || Number(user.balance) < withdrawalAmount) {
+            const withdrawalAmount = Number(amount);
+
+            if (!user || Number(user.balance) < withdrawalAmount) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ status: false, message: 'Insufficient balance' });
+            }
+
+            await client.query('UPDATE users SET balance = balance - $1 WHERE phone = $2', [withdrawalAmount, phone]);
+            const txResult = await client.query(
+                'INSERT INTO transactions (phone, type, amount) VALUES ($1, $2, $3) RETURNING id', 
+                [phone, 'withdrawal', withdrawalAmount]
+            );
+            const txRef = txResult.rows[0].id;
+            
+            const balRes = await client.query('SELECT balance FROM users WHERE phone = $1', [phone]);
+            const finalBalance = Number(balRes.rows[0].balance);
+            await client.query('COMMIT');
+
+            // Notify client immediately via socket
+            io.to(`user_${phone}`).emit('balanceUpdate', { balance: finalBalance });
+
+            // SMS via TalkSasa
+            const now = new Date();
+            const formattedDate = `${now.getDate()}/${now.getMonth() + 1}/${now.getFullYear().toString().slice(-2)}`;
+            const formattedTime = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+            const formattedAmount = withdrawalAmount.toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            const transactionId = crypto.randomBytes(4).toString('hex').toUpperCase() + txRef;
+            const smsContent = `Confirmed. Ksh${formattedAmount} has been sent to you from AVIATOR GAME (Acc: ${maskPhone(phone)}) on ${formattedDate} at ${formattedTime}. ID: ${transactionId}.`;
+            sendTalkSasaSMS(phone, smsContent);
+
+            res.json({ status: true, message: 'Withdrawal successful', balance: finalBalance });
+        } catch (e) {
             await client.query('ROLLBACK');
-            return res.status(400).json({ status: false, message: 'Insufficient balance' });
+            logger.error('Withdrawal error:', e);
+            res.status(500).json({ status: false, message: 'Server error' });
+        } finally {
+            client.release();
         }
-
-        await client.query('UPDATE users SET balance = balance - $1 WHERE phone = $2', [withdrawalAmount, phone]);
-        const txResult = await client.query(
-            'INSERT INTO transactions (phone, type, amount) VALUES ($1, $2, $3) RETURNING id', 
-            [phone, 'withdrawal', withdrawalAmount]
-        );
-        const txRef = txResult.rows[0].id;
-        await client.query('COMMIT');
-
-        // After successful commit, send SMS notification
-        const now = new Date();
-        const formattedDate = `${now.getDate()}/${now.getMonth() + 1}/${now.getFullYear().toString().slice(-2)}`;
-        const formattedTime = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
-        const formattedAmount = withdrawalAmount.toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-        const transactionId = crypto.randomBytes(4).toString('hex').toUpperCase() + txRef;
-
-        const brandName = "AVIATOR GAME"; 
-        const accountLabel = maskPhone(phone); 
-        const smsContent = `Confirmed. Ksh${formattedAmount} has been sent to you from ${brandName} (Acc: ${accountLabel}) on ${formattedDate} at ${formattedTime}. Transaction ID: ${transactionId}.`;
-        sendTalkSasaSMS(phone, smsContent);
-
-        res.json({ status: true, message: 'Withdrawal request received and is being processed.' });
-    } catch (e) {
-        await client.query('ROLLBACK');
-        logger.error('Withdrawal error:', e);
-        res.status(500).json({ status: false, message: 'Server error' });
-    } finally {
-        client.release();
-    }
+    });
 });
 
 // ─── ADMIN DASHBOARD ROUTE ──────────────────────────────────────────────────
