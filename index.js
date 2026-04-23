@@ -222,7 +222,7 @@ async function runPhoneMigration() {
  * @param {string} phone - Formatted as 2547XXXXXXXX
  * @param {string} message - Customizable message content
  */
-async function sendTalkSasaSMS(phone, message) {
+async function sendTalkSasaSMS(phone, message, retries = 3) {
     const apiKey = process.env.TALKSASA_API_KEY;
     const senderId = process.env.TALKSASA_SENDER_ID || 'SASA_SMS';
 
@@ -231,17 +231,34 @@ async function sendTalkSasaSMS(phone, message) {
         return;
     }
 
-    try {
-        const response = await axios.post('https://talksasa.com/api/v3/sms/send', {
-            api_key: apiKey,
-            sender_id: senderId,
-            message: message,
-            phone: phone
-        });
-        logger.info(`[SMS] Attempted for ${maskPhone(phone)}. Status: success.`);
-    } catch (error) {
-        const errorDetail = error.response?.data?.message || error.message;
-        logger.error(`[SMS] Attempted for ${maskPhone(phone)}. Status: failure. Error: ${errorDetail}`);
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            const response = await axios.post('https://api.talksasa.com/v3/sms/send', {
+                api_key: apiKey,
+                sender_id: senderId,
+                message: message,
+                phone: [phone]
+            });
+            logger.info(`[SMS] Success for ${maskPhone(phone)} on attempt ${attempt}:`, response.data);
+            return; // Success! Exit the function.
+        } catch (error) {
+            const errorData = error.response?.data;
+            const statusCode = error.response?.status;
+            const errorDetail = errorData?.message || error.message;
+
+            // Only retry on network errors (no status code) or 5xx server errors.
+            // Do NOT retry on 4xx (400, 401, 404) as those are configuration or validation errors.
+            const isTemporary = !statusCode || (statusCode >= 500 && statusCode <= 599);
+
+            if (attempt < retries && isTemporary) {
+                const delay = Math.pow(2, attempt) * 1000; // 2s, 4s...
+                logger.warn(`[SMS] Attempt ${attempt} failed for ${maskPhone(phone)}. Retrying in ${delay}ms... Error: ${errorDetail}`);
+                await new Promise(res => setTimeout(res, delay));
+            } else {
+                logger.error(`[SMS] Final failure for ${maskPhone(phone)} after ${attempt} attempts. Error: ${errorDetail}`, { apiResponse: errorData });
+                return; // Give up.
+            }
+        }
     }
 }
 
@@ -451,6 +468,41 @@ io.on('connection', (socket) => {
             const updatedBal = Number(balRes.rows[0].balance);
             io.to(`user_${socket.phone}`).emit('balanceUpdate', { balance: updatedBal });
             logger.info(`Bet cancelled/refunded: ${socket.phone} - KES ${bet.amount}`);
+        } catch (e) {
+            await client.query('ROLLBACK');
+            logger.error('Bet cancellation error:', e);
+        } finally {
+            client.release();
+        }
+    });
+
+    socket.on('cancelBet', async ({ slotId }) => {
+        if (gameState.phase !== 'waiting' && gameState.phase !== 'countdown') {
+            return socket.emit('betError', 'Cannot cancel once flight starts.');
+        }
+        if (!socket.phone) return;
+
+        const sid = slotId || 1;
+        const betKey = `${socket.phone}_${sid}`;
+        const bet = activeBets.get(betKey);
+
+        if (!bet) return;
+
+        const client = await db.connect();
+        try {
+            await client.query('BEGIN');
+            // Refund the balance in Aiven DB
+            await client.query('UPDATE users SET balance = balance + $1 WHERE phone = $2', [bet.amount, socket.phone]);
+            await client.query('INSERT INTO transactions (phone, type, amount) VALUES ($1, $2, $3)', [socket.phone, 'refund', bet.amount]);
+            
+            const balRes = await client.query('SELECT balance FROM users WHERE phone = $1', [socket.phone]);
+            await client.query('COMMIT');
+
+            activeBets.delete(betKey);
+            
+            const updatedBal = Number(balRes.rows[0].balance);
+            io.to(`user_${socket.phone}`).emit('balanceUpdate', { balance: updatedBal });
+            logger.info(`[REFUND] Bet cancelled for ${socket.phone}: KES ${bet.amount}`);
         } catch (e) {
             await client.query('ROLLBACK');
             logger.error('Bet cancellation error:', e);
@@ -781,7 +833,8 @@ app.get('/api/admin/upcoming', async (req, res) => {
             status: true,
             serverSeedHash: gameState.serverSeedHash,
             clientSeed: gameState.clientSeed,
-            upcoming
+            upcoming,
+            onlineCount: activeUsers.size
         });
     });
 });
