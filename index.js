@@ -240,9 +240,10 @@ async function sendTalkSasaSMS(phone, message, retries = 3) {
     for (let attempt = 1; attempt <= retries; attempt++) {
         try {
             const response = await axios.post('https://bulksms.talksasa.com/api/v3/sms/send', {
+                recipient: phone,
                 sender_id: senderId,
-                message: message,
-                phone: [phone]
+                type: "plain",
+                message: message
             }, {
                 headers: {
                     'Authorization': `Bearer ${apiKey}`,
