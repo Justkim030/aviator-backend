@@ -719,6 +719,38 @@ app.post('/api/withdraw', authLimiter, async (req, res) => {
     });
 });
 
+// ─── ADMIN: MANUAL BALANCE ADJUSTMENT ────────────────────────────────────────
+app.post('/api/admin/update-balance', async (req, res) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.status(401).json({ status: false, message: 'Unauthorized' });
+
+    const token = authHeader.split(' ')[1];
+    jwt.verify(token, JWT_SECRET, async (err, decoded) => {
+        if (err || decoded.phone !== ADMIN_PHONE) {
+            return res.status(403).json({ status: false, message: 'Forbidden' });
+        }
+
+        const targetPhone = normalizePhone(req.body.phone);
+        const newBalance = Number(req.body.balance);
+
+        if (isNaN(newBalance)) return res.status(400).json({ status: false, message: 'Invalid balance value' });
+
+        try {
+            await db.query('UPDATE users SET balance = $1 WHERE phone = $2', [newBalance, targetPhone]);
+            await db.query('INSERT INTO transactions (phone, type, amount) VALUES ($1, $2, $3)', [targetPhone, 'admin_adjustment', newBalance]);
+            
+            // Notify the user immediately if they are online
+            io.to(`user_${targetPhone}`).emit('balanceUpdate', { balance: newBalance });
+            
+            logger.info(`[ADMIN] Manual balance update for ${targetPhone} to ${newBalance}`);
+            res.json({ status: true, message: `Balance updated for ${targetPhone}` });
+        } catch (e) {
+            logger.error('[ADMIN] Error updating balance:', e);
+            res.status(500).json({ status: false, message: 'Database error' });
+        }
+    });
+});
+
 // ─── ADMIN DASHBOARD ROUTE ──────────────────────────────────────────────────
 // Provides visibility into the next 50 crash points for monitoring and debugging.
 app.get('/api/admin/upcoming', async (req, res) => {
