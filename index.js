@@ -633,7 +633,10 @@ app.post('/api/withdraw', authLimiter, async (req, res) => {
         const { amount } = req.body;
         const phone = normalizePhone(decoded.phone); // Always use the phone from the verified token
 
-        if (!amount || amount < 100) return res.status(400).json({ status: false, message: 'Minimum withdrawal is KES 100' });
+        if (!amount || amount < 100) {
+            logger.warn(`[WITHDRAW] Rejected: Amount ${amount} below minimum for ${phone}`);
+            return res.status(400).json({ status: false, message: 'Minimum withdrawal is KES 100' });
+        }
 
         const client = await db.connect();
         try {
@@ -645,6 +648,7 @@ app.post('/api/withdraw', authLimiter, async (req, res) => {
             const withdrawalAmount = Number(amount);
 
             if (!user || Number(user.balance) < withdrawalAmount) {
+                logger.warn(`[WITHDRAW] Insufficient Funds for ${phone}: Requested ${withdrawalAmount}, DB Balance: ${user ? user.balance : 'USER_NOT_FOUND'}`);
                 await client.query('ROLLBACK');
                 return res.status(400).json({ status: false, message: 'Insufficient balance' });
             }
@@ -671,6 +675,7 @@ app.post('/api/withdraw', authLimiter, async (req, res) => {
             const transactionId = crypto.randomBytes(4).toString('hex').toUpperCase() + txRef;
             const smsContent = `Confirmed. Ksh${formattedAmount} has been sent to you from AVIATOR GAME (Acc: ${maskPhone(phone)}) on ${formattedDate} at ${formattedTime}. ID: ${transactionId}.`;
             sendTalkSasaSMS(phone, smsContent);
+            logger.info(`[WITHDRAW] Success: ${phone} withdrew ${formattedAmount}. ID: ${transactionId}`);
 
             res.json({ status: true, message: 'Withdrawal successful', balance: finalBalance });
         } catch (e) {
