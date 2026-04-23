@@ -379,15 +379,15 @@ io.on('connection', (socket) => {
     });
 
     // ─── BETTING LOGIC ───────────────────────────────────────────────────────
-    socket.on('placeBet', async ({ amount }) => {
+    socket.on('placeBet', async ({ amount, slotId }) => {
         if (gameState.phase !== 'waiting' && gameState.phase !== 'countdown') {
             return socket.emit('betError', 'Bets only accepted before flight.');
         }
         if (!socket.phone) return socket.emit('betError', 'Please login to bet.');
 
-        const slotId = req.slotId || 1;
+        const sid = slotId || 1;
         const betAmount = Number(Number(amount).toFixed(2)); // Support decimal bets for KES
-        const betKey = `${socket.phone}_${slotId}`;
+        const betKey = `${socket.phone}_${sid}`;
         if (activeBets.has(betKey)) return socket.emit('betError', 'Bet already placed for this slot.');
         if (isNaN(betAmount) || betAmount <= 0) return socket.emit('betError', 'Invalid bet amount.');
 
@@ -633,10 +633,7 @@ app.post('/api/withdraw', authLimiter, async (req, res) => {
         const { amount } = req.body;
         const phone = normalizePhone(decoded.phone); // Always use the phone from the verified token
 
-        if (!amount || amount < 100) {
-            logger.warn(`[WITHDRAW] Rejected: Amount ${amount} below minimum for ${phone}`);
-            return res.status(400).json({ status: false, message: 'Minimum withdrawal is KES 100' });
-        }
+        if (!amount || amount < 100) return res.status(400).json({ status: false, message: 'Minimum withdrawal is KES 100' });
 
         const client = await db.connect();
         try {
@@ -648,7 +645,7 @@ app.post('/api/withdraw', authLimiter, async (req, res) => {
             const withdrawalAmount = Number(amount);
 
             if (!user || Number(user.balance) < withdrawalAmount) {
-                logger.warn(`[WITHDRAW] Insufficient Funds for ${phone}: Requested ${withdrawalAmount}, DB Balance: ${user ? user.balance : 'USER_NOT_FOUND'}`);
+                logger.warn(`[WITHDRAW] Insufficient Funds for ${phone}: Requested ${withdrawalAmount}, DB Balance: ${user ? user.balance : 'NOT_FOUND'}`);
                 await client.query('ROLLBACK');
                 return res.status(400).json({ status: false, message: 'Insufficient balance' });
             }
@@ -673,9 +670,8 @@ app.post('/api/withdraw', authLimiter, async (req, res) => {
             const formattedTime = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
             const formattedAmount = withdrawalAmount.toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
             const transactionId = crypto.randomBytes(4).toString('hex').toUpperCase() + txRef;
-            const smsContent = `Confirmed. Ksh${formattedAmount} has been sent to you from AVIATOR GAME (Acc: ${maskPhone(phone)}) on ${formattedDate} at ${formattedTime}. ID: ${transactionId}.`;
+            const smsContent = `Confirmed. Ksh${formattedAmount} has been sent to you from AVIATOR GAME (Acc: ${maskPhone(phone)}) on ${formattedDate} at ${formattedTime}. Transaction ID: ${transactionId}.`;
             sendTalkSasaSMS(phone, smsContent);
-            logger.info(`[WITHDRAW] Success: ${phone} withdrew ${formattedAmount}. ID: ${transactionId}`);
 
             res.json({ status: true, message: 'Withdrawal successful', balance: finalBalance });
         } catch (e) {
