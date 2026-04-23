@@ -233,7 +233,7 @@ async function sendTalkSasaSMS(phone, message, retries = 3) {
 
     for (let attempt = 1; attempt <= retries; attempt++) {
         try {
-            const response = await axios.post('https://api.talksasa.com/v3/sms/send', {
+            const response = await axios.post('https://talksasa.com/api/v3/sms/send', {
                 api_key: apiKey,
                 sender_id: senderId,
                 message: message,
@@ -436,41 +436,6 @@ io.on('connection', (socket) => {
         } catch (e) {
             await client.query('ROLLBACK');
             logger.error('Bet placement error:', e);
-        } finally {
-            client.release();
-        }
-    });
-
-    socket.on('cancelBet', async ({ slotId }) => {
-        if (gameState.phase !== 'waiting' && gameState.phase !== 'countdown') {
-            return socket.emit('betError', 'Cannot cancel once flight starts.');
-        }
-        if (!socket.phone) return;
-
-        const sid = slotId || 1;
-        const betKey = `${socket.phone}_${sid}`;
-        const bet = activeBets.get(betKey);
-
-        if (!bet) return;
-
-        const client = await db.connect();
-        try {
-            await client.query('BEGIN');
-            // Refund the balance
-            await client.query('UPDATE users SET balance = balance + $1 WHERE phone = $2', [bet.amount, socket.phone]);
-            await client.query('INSERT INTO transactions (phone, type, amount) VALUES ($1, $2, $3)', [socket.phone, 'refund', bet.amount]);
-            
-            const balRes = await client.query('SELECT balance FROM users WHERE phone = $1', [socket.phone]);
-            await client.query('COMMIT');
-
-            activeBets.delete(betKey);
-            
-            const updatedBal = Number(balRes.rows[0].balance);
-            io.to(`user_${socket.phone}`).emit('balanceUpdate', { balance: updatedBal });
-            logger.info(`Bet cancelled/refunded: ${socket.phone} - KES ${bet.amount}`);
-        } catch (e) {
-            await client.query('ROLLBACK');
-            logger.error('Bet cancellation error:', e);
         } finally {
             client.release();
         }
