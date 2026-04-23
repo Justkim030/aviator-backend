@@ -223,23 +223,34 @@ async function runPhoneMigration() {
  * @param {string} message - Customizable message content
  */
 async function sendTalkSasaSMS(phone, message, retries = 3) {
-    const apiKey = process.env.TALKSASA_API_KEY;
+    const apiKey = process.env.TALKSASA_BEARER_TOKEN;
     const senderId = process.env.TALKSASA_SENDER_ID || 'SASA_SMS';
+    const DISABLE_SMS = process.env.DISABLE_SMS === 'true';
+
+    if (DISABLE_SMS) {
+        logger.info('[SMS] Disabled via DISABLE_SMS=true');
+        return;
+    }
 
     if (!apiKey) {
-        logger.error('[SMS] TalkSasa API Key is missing');
+        logger.error('[SMS] TALKSASA_BEARER_TOKEN missing from .env');
         return;
     }
 
     for (let attempt = 1; attempt <= retries; attempt++) {
         try {
-            const response = await axios.post('https://talksasa.com/api/v3/sms/send', {
-                api_key: apiKey,
+            const response = await axios.post('https://bulksms.talksasa.com/api/v3/sms/send', {
                 sender_id: senderId,
                 message: message,
                 phone: [phone]
+            }, {
+                headers: {
+                    'Authorization': `Bearer ${apiKey}`,
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
+                }
             });
-            logger.info(`[SMS] Success for ${maskPhone(phone)} on attempt ${attempt}:`, response.data);
+            logger.info(`[SMS] Success for ${maskPhone(phone)}: ${response.data.status || 'OK'}`);
             return; // Success! Exit the function.
         } catch (error) {
             const errorData = error.response?.data;
