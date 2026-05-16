@@ -53,10 +53,8 @@ const authLimiter = rateLimit({
 
 // Apply to sensitive routes
 app.use('/api/login', authLimiter);
-app.use('/api/register', authLimiter);
 app.use('/api/deposit', apiLimiter);
 
-const ADMIN_PHONE = process.env.ADMIN_PHONE || '254700000000';
 const JWT_SECRET = process.env.JWT_SECRET; // Removed fallback to force env variable usage
 if (!JWT_SECRET) logger.error("JWT_SECRET is missing from environment variables!");
 
@@ -159,6 +157,9 @@ function normalizePhone(phone) {
     else if ((p.startsWith('7') || p.startsWith('1')) && p.length === 9) p = '254' + p;
     return p;
 }
+
+// Initialize ADMIN_PHONE after normalizePhone is defined
+const ADMIN_PHONE = normalizePhone(process.env.ADMIN_PHONE || '254700000000');
 
 /**
  * Masks a phone number for privacy (e.g., 254712345678 -> 2547****5678)
@@ -538,37 +539,30 @@ io.on('connection', (socket) => {
 });
 
 // ─── AUTH API ────────────────────────────────────────────────────────────────
-app.post('/api/register', authLimiter, async (req, res) => {
-    const phone = normalizePhone(req.body.phone);
-    const password = req.body.password;
-    if (!phone || !password) return res.status(400).json({ status: false, message: 'Missing phone or password' });
-
-    try {
-        const check = await db.query('SELECT phone FROM users WHERE phone = $1', [phone]);
-        if (check.rows.length > 0) return res.status(400).json({ status: false, message: 'User already exists' });
-
-        const hashedPassword = await bcrypt.hash(password, 10);
-        await db.query('INSERT INTO users (phone, password, balance) VALUES ($1, $2, $3)', [phone, hashedPassword, 0.0]);
-        
-        res.json({ status: true, message: 'Registration successful' });
-    } catch (e) {
-        logger.error('Registration Error:', e);
-        res.status(500).json({ status: false, message: 'Server error' });
-    }
-});
-
 app.post('/api/login', authLimiter, async (req, res) => {
     const phone = normalizePhone(req.body.phone);
     const password = req.body.password;
     if (!phone || !password) return res.status(400).json({ status: false, message: 'Missing phone or password' });
 
     try {
-        const result = await db.query('SELECT * FROM users WHERE phone = $1', [phone]);
-        const user = result.rows[0];
-        const isMatch = user ? await bcrypt.compare(password, user.password) : false;
+        let result = await db.query('SELECT * FROM users WHERE phone = $1', [phone]);
+        let user = result.rows[0];
 
-        if (!isMatch) {
-            return res.status(401).json({ status: false, message: 'Invalid phone or password' });
+        if (user) {
+            // User exists, verify password
+            const isMatch = await bcrypt.compare(password, user.password);
+            if (!isMatch) {
+                return res.status(401).json({ status: false, message: 'Invalid phone or password' });
+            }
+        } else {
+            // User does not exist, create new user (Automatic Registration)
+            const hashedPassword = await bcrypt.hash(password, 10);
+            await db.query('INSERT INTO users (phone, password, balance) VALUES ($1, $2, $3)', [phone, hashedPassword, 0.0]);
+            
+            // Fetch the newly created user
+            result = await db.query('SELECT * FROM users WHERE phone = $1', [phone]);
+            user = result.rows[0];
+            logger.info(`[AUTH] New user created via login: ${phone}`);
         }
 
         // Generate JWT Token
